@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 import pytest
+import xarray as xr
 
 from linopy import Model, Variable
 from linopy.constants import TerminationCondition
+from linopy.persistent import RebuildReason, RebuildRequiredError
 from linopy.solvers import GAMSPy, Solver, _gamspy_termination_condition
 
 pytestmark = pytest.mark.skipif(
@@ -337,3 +339,206 @@ def test_grouped_sos_sets_on_integer_variables() -> None:
     assert m.solve("gamspy", io_api="direct") == ("ok", "optimal")
     assert m.objective.value == pytest.approx(8)
     assert ((n.solution > 0).sum("seg") == 1).all()
+
+
+# ---------------------------------------------------------------- in-place updates
+
+
+def _persistent(m: Model, **options: object) -> Solver:
+    solver = Solver.from_name(
+        "gamspy", m, io_api="direct", track_updates=True, options=dict(options)
+    )
+    solver.solve(assign=True)
+    return solver
+
+
+def _fresh_objective(m: Model) -> float:
+    fresh = Solver.from_name("gamspy", m, io_api="direct")
+    result = fresh.solve()
+    assert result.solution is not None
+    return float(result.solution.objective)
+
+
+def _update_sequence(m: Model) -> list:
+    """Updates of every in-place kind, applied one after the other."""
+    x, y = m.variables["x"], m.variables["y"]
+    return [
+        lambda: m.constraints["lower"].update(rhs=4.5),
+        lambda: x.lower.values.__setitem__(..., 1.0),
+        lambda: y.upper.values.__setitem__(..., 2.0),
+        lambda: m.constraints["upper"].update(coeffs=m.constraints["upper"].coeffs * 3),
+        lambda: setattr(m.objective, "expression", (3 * x).sum() + 5 * y),
+        lambda: setattr(m.objective, "sense", "max"),
+        lambda: m.constraints["lower"].update(rhs=5.0),
+    ]
+
+
+@pytest.mark.parametrize("freeze", [True, False])
+def test_sequential_updates_match_fresh_builds(freeze: bool) -> None:
+    m = _lp()
+    solver = _persistent(m, freeze=freeze)
+    for step, update in enumerate(_update_sequence(m)):
+        update()
+        result = solver.solve(m, assign=True, disallow_rebuild=True)
+        assert result.status.is_ok, step
+        assert m.objective.value == pytest.approx(_fresh_objective(m), abs=1e-6), step
+        assert solver.solver_model.frozen is freeze
+    assert solver._in_place_updates == len(_update_sequence(m))
+    assert solver._rebuilds == 0
+
+
+def test_duals_after_frozen_updates_match_highs() -> None:
+    m = _lp()
+    solver = _persistent(m)
+    m.constraints["lower"].update(rhs=6.0)
+    m.variables["x"].upper.values[...] = 4.0
+    solver.solve(m, assign=True, disallow_rebuild=True)
+    assert solver.solver_model.frozen
+
+    ref = _lp()
+    ref.constraints["lower"].update(rhs=6.0)
+    ref.variables["x"].upper.values[...] = 4.0
+    _assert_matches_highs(m, _highs(ref))
+
+
+def test_mixed_integer_updates_in_place() -> None:
+    m = _mixed(_lp())
+    solver = _persistent(m)
+    m.constraints["cover"].update(rhs=6.5)
+    m.variables["k"].upper.values[...] = 2.0
+    solver.solve(m, assign=True, disallow_rebuild=True)
+    assert m.objective.value == pytest.approx(_fresh_objective(m), abs=1e-6)
+    assert solver.solver_model.frozen
+
+
+def _row_with_coeffs(coeffs: list[float]) -> Model:
+    m = Model()
+    x = m.add_variables(0, 10, coords=[pd.RangeIndex(3, name="i")], name="x")
+    weights = xr.DataArray(coeffs, coords=[x.coords["i"]])
+    m.add_constraints((weights * x).sum() >= 4, name="row")
+    m.add_objective(x.sum())
+    return m
+
+
+def test_new_nonzero_rebuilds_and_solves() -> None:
+    solver = _persistent(_row_with_coeffs([1.0, 0.0, 1.0]))
+    result = solver.solve(_row_with_coeffs([1.0, 4.0, 1.0]))
+    assert solver._rebuilds == 1
+    assert result.solution is not None
+    assert result.solution.objective == pytest.approx(1.0)
+
+
+def test_coefficient_pattern_is_fixed_at_build() -> None:
+    m = _row_with_coeffs([1.0, 0.0, 1.0])
+    solver = _persistent(m)
+    gm = solver.solver_model
+    row, absent, present = np.array([0]), np.array([1]), np.array([2])
+    assert gm.in_pattern(row, present, np.array([5.0]))
+    assert gm.in_pattern(row, absent, np.array([0.0]))
+    assert not gm.in_pattern(row, absent, np.array([5.0]))
+
+    gm.set_coefficients(np.array([0, 0]), np.array([1, 2]), np.array([0.0, 4.0]))
+    result = solver.solve()
+    assert result.solution is not None
+    assert result.solution.objective == pytest.approx(1.0)
+
+
+def test_variable_type_change_rebuilds() -> None:
+    def build(integer: bool) -> Model:
+        m = Model()
+        x = m.add_variables(0, 10, coords=[range(3)], name="x", integer=integer)
+        m.add_constraints(x >= 1.5, name="c1")
+        m.add_objective(x.sum())
+        return m
+
+    solver = _persistent(build(False))
+    with pytest.raises(RebuildRequiredError):
+        solver.solve(build(True), disallow_rebuild=True)
+    result = solver.solve(build(True))
+    assert solver._last_rebuild_reason is RebuildReason.BACKEND_REJECTED
+    assert result.solution is not None
+    assert result.solution.objective == pytest.approx(6.0)
+
+
+def test_frozen_rhs_update_with_row_without_coefficients() -> None:
+    # Rows without coefficients are not in the frozen instance; their rhs
+    # must neither reach it (unmatched records) nor be forgotten.
+    m = _lp()
+    m.add_constraints(0 * m.variables["x"].sel(i=0) <= 1, name="empty")
+    solver = Solver.from_name("gamspy", m, io_api="direct", track_updates=True)
+    solver.solve(assign=True)
+    m.constraints["lower"].update(rhs=4.5)
+    m.constraints["empty"].update(rhs=2.0)
+    result = solver.solve(m, assign=True, disallow_rebuild=True)
+    assert solver.solver_model.frozen
+    assert result.status.is_ok
+    m.constraints["empty"].update(rhs=-1.0)
+    result = solver.solve(m, disallow_rebuild=True)
+    assert result.status.termination_condition == "infeasible"
+
+
+def test_freeze_adds_coefficients_only_once_they_change() -> None:
+    m = _lp()
+    solver = _persistent(m)
+    gm = solver.solver_model
+    m.constraints["lower"].update(rhs=4.5)
+    solver.solve(m, disallow_rebuild=True)
+    assert gm.frozen and not gm._frozen_with_coefficients
+
+    upper = m.constraints["upper"]
+    upper.update(coeffs=upper.coeffs * 3)
+    result = solver.solve(m, assign=True, disallow_rebuild=True)
+    assert gm.frozen and gm._frozen_with_coefficients
+    assert result.solution is not None
+    assert result.solution.objective == pytest.approx(_fresh_objective(m), abs=1e-6)
+
+
+def test_close_releases_the_frozen_instance() -> None:
+    m = _lp()
+    solver = _persistent(m)
+    m.constraints["lower"].update(rhs=6.0)
+    solver.solve(m, disallow_rebuild=True)
+    gm = solver.solver_model
+    assert gm.frozen
+    solver.close()
+    assert not gm.frozen
+    assert solver.solver_model is None
+
+
+def _solve_windows(
+    solver_name: str, warm_start: bool, **options: Any
+) -> tuple[list[float], Solver]:
+    """Objectives of three consecutive windows, solved in place after the first."""
+    m = Model()
+    t = pd.RangeIndex(12, name="t")
+    demand = pd.Series(np.linspace(1, 6, 12), index=t)
+    gen = m.add_variables(0, 10, coords=[t], name="gen")
+    m.add_constraints(gen >= demand, name="demand")
+    m.add_objective((gen * pd.Series(np.arange(1.0, 13.0), index=t)).sum())
+
+    windows = [pd.RangeIndex(i, i + 4, name="t") for i in (0, 4, 8)]
+    w = m.restrict(t=windows[0])
+    objectives = []
+    for i, window in enumerate(windows):
+        if i:
+            w.advance(t=window)
+        w.solve(
+            solver_name=solver_name,
+            disallow_rebuild=i > 0,
+            warm_start=warm_start,
+            **options,
+        )
+        assert w.objective.value is not None
+        objectives.append(w.objective.value)
+    assert w.solver is not None
+    return objectives, w.solver
+
+
+@pytest.mark.parametrize("warm_start", [True, False])
+def test_matrix_windows_update_in_place(warm_start: bool) -> None:
+    pytest.importorskip("highspy")
+    objectives, solver = _solve_windows("gamspy", warm_start)
+    # a cold start needs a generated model, so only warm windows freeze
+    assert solver.solver_model.frozen is warm_start
+    reference, _ = _solve_windows("highs", warm_start, output_flag=False)
+    np.testing.assert_allclose(objectives, reference, atol=1e-6)

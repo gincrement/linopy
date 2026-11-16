@@ -7,13 +7,14 @@ import pytest
 
 from linopy import Model
 from linopy.persistent import RebuildReason
-from linopy.solvers import Gurobi, Highs, Mosek, Solver, Xpress
+from linopy.solvers import GAMSPy, Gurobi, Highs, Mosek, Solver, Xpress
 
 _BACKENDS: dict[str, tuple[type[Solver], dict[str, Any]]] = {
     "gurobi": (Gurobi, {"OutputFlag": 0}),
     "highs": (Highs, {"output_flag": False}),
     "xpress": (Xpress, {"OUTPUTLOG": 0}),
     "mosek": (Mosek, {"MSK_IPAR_LOG": 0}),
+    "gamspy": (GAMSPy, {}),
 }
 
 _SIGN_CHANGE_IN_PLACE: dict[str, bool] = {
@@ -21,6 +22,7 @@ _SIGN_CHANGE_IN_PLACE: dict[str, bool] = {
     "highs": False,
     "xpress": True,
     "mosek": False,
+    "gamspy": False,
 }
 
 

@@ -9,11 +9,12 @@ import pytest
 
 from linopy import Model
 from linopy.persistent import ModelDiff, RebuildReason, UpdatesDisabledError
-from linopy.solvers import Gurobi, Highs, Solver
+from linopy.solvers import GAMSPy, Gurobi, Highs, Solver
 
 _BACKENDS: dict[str, tuple[type[Solver], dict[str, Any]]] = {
     "gurobi": (Gurobi, {"OutputFlag": 0}),
     "highs": (Highs, {"output_flag": False}),
+    "gamspy": (GAMSPy, {}),
 }
 
 
@@ -23,6 +24,8 @@ def _have(name: str) -> bool:
             import gurobipy  # noqa: F401
         elif name == "highs":
             import highspy  # noqa: F401
+        elif name == "gamspy":
+            return GAMSPy.is_available() and GAMSPy.license_status().ok
         return True
     except ImportError:
         return False
@@ -36,6 +39,10 @@ SOLVER_PARAMS = [
     pytest.param(
         "highs",
         marks=pytest.mark.skipif(not _have("highs"), reason="highspy not installed"),
+    ),
+    pytest.param(
+        "gamspy",
+        marks=pytest.mark.skipif(not _have("gamspy"), reason="gamspy not installed"),
     ),
 ]
 

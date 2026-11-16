@@ -5415,6 +5415,13 @@ class GAMSPy(Solver[None]):
       Any other option is added to it as well.
     * ``output`` : a text stream receiving the GAMS log, e.g. ``sys.stdout``.
       ``log_fn`` writes the log to a file instead.
+    * ``freeze`` : whether to freeze the GAMS model on its first in-place
+      update (default ``True``), so that later solves skip model generation.
+
+    In-place updates (``Solver(..., track_updates=True)`` or matrix windows)
+    change variable bounds, right-hand sides, linear objective coefficients
+    and matrix coefficients within the sparsity pattern; any other change
+    rebuilds the model.
 
     GAMS has no "infeasible or unbounded" model status. Solvers that cannot
     tell the two apart after presolve report the model as infeasible; with
@@ -5439,11 +5446,60 @@ class GAMSPy(Solver[None]):
             SolverFeature.MIP_DUAL_BOUND_REPORT,
         }
     )
+    supports_persistent_update: ClassVar[bool] = True
 
     @classmethod
     @functools.cache
     def is_available(cls) -> bool:
         return _has_module("gamspy")
+
+    def _validate_update(self, diff: ModelDiff) -> None:
+        super()._validate_update(diff)
+        if diff.var_type_positions.size:
+            raise UnsupportedUpdate(
+                "GAMSPy fixes the variable type per symbol; changing it needs a rebuild"
+            )
+        if diff.n_coef_updates and not self.solver_model.in_pattern(
+            diff.con_coef_rows, diff.con_coef_cols, diff.con_coef_vals
+        ):
+            raise UnsupportedUpdate(
+                "GAMSPy fixes the sparsity pattern of the constraint matrix"
+            )
+
+    def _apply_var_bounds(
+        self, ctx: Any, indices: np.ndarray, lower: np.ndarray, upper: np.ndarray
+    ) -> None:
+        ctx.set_bounds(indices, lower, upper)
+
+    def _apply_con_rhs(self, ctx: Any, diff: ModelDiff) -> None:
+        ctx.set_rhs(diff.con_rhs_indices, diff.con_rhs_values)
+
+    def _apply_con_coefs(
+        self, ctx: Any, rows: np.ndarray, cols: np.ndarray, vals: np.ndarray
+    ) -> None:
+        ctx.set_coefficients(rows, cols, vals)
+
+    def _apply_obj_linear(
+        self, ctx: Any, indices: np.ndarray, values: np.ndarray
+    ) -> None:
+        ctx.set_objective(indices, values)
+
+    def _apply_obj_sense(self, ctx: Any, sense: str) -> None:
+        ctx.set_sense(sense)
+
+    def _apply_end(self, ctx: Any) -> None:
+        # After an in-place update the model is evidently solved repeatedly:
+        # the next solve freezes it, so later solves skip model generation.
+        if self.solver_options.get("freeze", True):
+            ctx.freeze_requested = True
+
+    def _discard_warm_start(self) -> None:
+        self.solver_model.discard_start()
+
+    def close(self) -> None:
+        if self.solver_model is not None:
+            self.solver_model.close()
+        super().close()
 
     @classmethod
     def _license_probe(cls) -> None:
@@ -5507,14 +5563,17 @@ class GAMSPy(Solver[None]):
 
         return GamsMatrixModel(M, sos=sos)
 
-    def _split_options(self) -> dict[str, Any]:
+    def _split_options(self, cold_start: bool = False) -> dict[str, Any]:
         """Sort the solver options into keyword arguments of ``gamspy.Model.solve``."""
         opts = dict(self.solver_options)
+        if cold_start:
+            opts["basis_detection_threshold"] = 1
         solve_kwargs: dict[str, Any] = {}
         if (name := opts.pop("solver", None)) is not None:
             solve_kwargs["solver"] = name
         if (output := opts.pop("output", None)) is not None:
             solve_kwargs["output"] = output
+        opts.pop("freeze", None)
         solver_options = dict(opts.pop("solver_options", None) or {})
         fields = gamspy.Options.model_fields
         gams_options = {k: opts.pop(k) for k in list(opts) if k in fields}
@@ -5544,7 +5603,11 @@ class GAMSPy(Solver[None]):
         return self._solve(self.solver_model, log_fn=log_fn)
 
     def _solve(self, gm: Any, log_fn: Path | None = None) -> Result:
-        solve_kwargs = self._split_options()
+        solve_kwargs = self._split_options(cold_start=gm.cold_start)
+        if gm.cold_start:
+            gm.cold_start = False
+        elif gm.freeze_requested:
+            gm.freeze()
 
         if gm.trivially_infeasible():
             status = Status.from_termination_condition(TerminationCondition.infeasible)
