@@ -344,10 +344,11 @@ def test_grouped_sos_sets_on_integer_variables() -> None:
 # ---------------------------------------------------------------- in-place updates
 
 
-def _persistent(m: Model, **options: object) -> Solver:
+def _persistent(m: Model, **options: object) -> GAMSPy:
     solver = Solver.from_name(
         "gamspy", m, io_api="direct", track_updates=True, options=dict(options)
     )
+    assert isinstance(solver, GAMSPy)
     solver.solve(assign=True)
     return solver
 
@@ -542,3 +543,178 @@ def test_matrix_windows_update_in_place(warm_start: bool) -> None:
     assert solver.solver_model.frozen is warm_start
     reference, _ = _solve_windows("highs", warm_start, output_flag=False)
     np.testing.assert_allclose(objectives, reference, atol=1e-6)
+
+
+# ---------------------------------------------------------- GUSS scenario solves
+
+
+def _variants() -> list[Model]:
+    """Variants of ``_lp`` changing each kind of scenario data."""
+    rhs = _lp()
+    rhs.constraints["lower"].update(rhs=4.5)
+    bounds = _lp()
+    bounds.variables["x"].upper.values[...] = 3.5
+    bounds.variables["y"].lower.values[...] = 0.5
+    cost = _lp()
+    x, y = cost.variables["x"], cost.variables["y"]
+    cost.objective.expression = (3 * x).sum() + 5 * y
+    coef = _lp()
+    upper = coef.constraints["upper"]
+    upper.update(coeffs=upper.coeffs * 3)
+    mixed = _lp()
+    mixed.constraints["lower"].update(rhs=5.0)
+    mixed.variables["y"].upper.values[...] = 2.0
+    return [_lp(), rhs, bounds, cost, coef, mixed]
+
+
+def _scenario_solver(m: Model) -> GAMSPy:
+    solver = Solver.from_name("gamspy", m, io_api="direct")
+    assert isinstance(solver, GAMSPy)
+    return solver
+
+
+def test_scenarios_match_separate_solves() -> None:
+    pytest.importorskip("highspy")
+    solver = _scenario_solver(_lp())
+    variants = _variants()
+    results = solver.solve_scenarios(variants)
+    assert len(results) == len(variants)
+    for k, (variant, result) in enumerate(zip(variants, results)):
+        assert result.status.is_ok, k
+        variant.assign_result(result, solver=solver)
+        _assert_matches_highs(variant, _highs(_variants()[k]))
+
+
+def test_infeasible_scenario_does_not_affect_the_others() -> None:
+    feasible = _lp()
+    feasible.constraints["lower"].update(rhs=4.5)
+    infeasible = _lp()
+    infeasible.variables["x"].upper.values[...] = 1.0  # sum(x) == 9 impossible
+    empty_row = _lp()
+
+    solver = _scenario_solver(_lp())
+    results = solver.solve_scenarios([feasible, infeasible, empty_row])
+    assert results[0].status.is_ok
+    assert results[1].status.termination_condition == "infeasible"
+    assert results[1].solution is not None and np.isnan(results[1].solution.objective)
+    assert results[2].status.is_ok
+    assert results[0].solution is not None and results[2].solution is not None
+    assert results[0].solution.objective > results[2].solution.objective
+
+
+def test_scenario_violating_a_row_without_coefficients() -> None:
+    def build(rhs: float) -> Model:
+        m = _lp()
+        m.add_constraints(0 * m.variables["x"].sel(i=0) <= rhs, name="empty")
+        return m
+
+    solver = _scenario_solver(build(1.0))
+    ok, violated = solver.solve_scenarios([build(2.0), build(-1.0)])
+    assert ok.status.is_ok
+    assert violated.status.termination_condition == "infeasible"
+
+
+def test_mixed_integer_scenarios() -> None:
+    base = _mixed(_lp())
+    variant = _mixed(_lp())
+    variant.constraints["cover"].update(rhs=6.5)
+    variant.variables["k"].upper.values[...] = 2.0
+
+    solver = _scenario_solver(base)
+    results = solver.solve_scenarios([_mixed(_lp()), variant])
+    for model, result in zip((_mixed(_lp()), variant), results):
+        assert result.status.is_ok
+        assert result.solution is not None
+        assert result.solution.dual.size == 0
+        assert result.solution.objective == pytest.approx(
+            _fresh_objective(model), abs=1e-6
+        )
+
+
+def test_models_that_are_no_variants_are_rejected() -> None:
+    solver = _scenario_solver(_lp())
+
+    added = _lp()
+    added.add_constraints(added.variables["y"] <= 1, name="extra")
+    with pytest.raises(ValueError, match="Model 1 is no variant"):
+        solver.solve_scenarios([_lp(), added])
+
+    flipped = _lp("max")
+    with pytest.raises(ValueError, match="objective sense"):
+        solver.solve_scenarios([flipped])
+
+    signed = _lp()
+    signed.constraints["lower"].update(sign="<=")
+    with pytest.raises(ValueError, match="sign"):
+        solver.solve_scenarios([signed])
+
+
+def test_repeated_scenario_runs_and_regular_solves() -> None:
+    m = _lp()
+    solver = _scenario_solver(m)
+    first = solver.solve_scenarios(_variants())
+    second = solver.solve_scenarios(_variants()[::-1])
+    for a, b in zip(first, second[::-1]):
+        assert a.solution is not None and b.solution is not None
+        assert a.solution.objective == pytest.approx(b.solution.objective)
+
+    # the built model is untouched by the scenario data
+    result = solver.solve()
+    assert result.solution is not None
+    assert result.solution.objective == pytest.approx(_fresh_objective(_lp()))
+
+
+def test_scenarios_on_a_frozen_model() -> None:
+    m = _lp()
+    solver = _persistent(m)
+    m.constraints["lower"].update(rhs=4.5)
+    solver.solve(m, disallow_rebuild=True)
+    assert solver.solver_model.frozen
+
+    (result,) = solver.solve_scenarios([_variants()[2]])
+    assert result.solution is not None
+    assert result.solution.objective == pytest.approx(
+        _fresh_objective(_variants()[2]), abs=1e-6
+    )
+
+
+# ---------------------------------------------------------------- remote backends
+
+
+def test_backend_and_client_are_passed_to_gamspy(monkeypatch: Any) -> None:
+    client = object()
+    m = _lp()
+    solver = Solver.from_name(
+        "gamspy",
+        m,
+        io_api="direct",
+        track_updates=True,
+        options={"backend": "neos", "client": client, "solver": "cplex"},
+    )
+    gm = solver.solver_model
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(gm.model, "solve", lambda **kwargs: calls.append(kwargs))
+
+    gm.freeze_requested = True
+    solver.solve()
+    assert calls[-1]["backend"] == "neos"
+    assert calls[-1]["client"] is client
+    assert calls[-1]["solver"] == "cplex"
+    # frozen models only run locally
+    assert not gm.frozen
+
+
+def test_sigint_handler_is_restored_after_gams_runs() -> None:
+    # GAMSPy replaces the process-wide SIGINT handler when it starts GAMS;
+    # Ctrl-C must keep working for other solvers once GAMS has run.
+    import signal
+
+    before = signal.getsignal(signal.SIGINT)
+    m = _lp()
+    solver = _persistent(m)
+    m.constraints["lower"].update(rhs=4.5)
+    solver.solve(m, disallow_rebuild=True)  # freezes and runs frozen
+    solver.solve_scenarios([_lp()])
+    assert signal.getsignal(signal.SIGINT) is before
+    GAMSPy._license_probe()
+    assert signal.getsignal(signal.SIGINT) is before

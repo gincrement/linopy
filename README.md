@@ -150,6 +150,7 @@ Fri    0          4
 * [Cplex](https://www.ibm.com/de-de/analytics/cplex-optimizer)
 * [MOSEK](https://www.mosek.com/)
 * [COPT](https://www.shanshu.ai/copt)
+* [GAMSPy](https://gamspy.readthedocs.io/) (any solver of a GAMS system)
 * [cuOpt](https://docs.nvidia.com/cuopt/)
 * [cuPDLPx](https://github.com/MIT-Lu-Lab/cuPDLPx)
 * [Knitro](https://www.artelys.com/solvers/knitro/)

@@ -32,6 +32,7 @@ linopy 1.0 makes the strict arithmetic convention the only behaviour and puts de
 
 **Other features**
 
+- `solver_name="gamspy"` solves through [GAMSPy](https://gamspy.readthedocs.io/) with any solver of a GAMS system, chosen with the `solver` option, e.g. `m.solve("gamspy", solver="cplex")`. The model is passed as data, not as a file. It supports LP, MIP, QP, semi-continuous variables, SOS constraints and in-place updates, which freeze the GAMS model so later solves skip model generation. `GAMSPy.solve_scenarios(models)` solves many variants of a model in a single GAMS run (GUSS), and the `backend` option runs GAMS on GAMS Engine or NEOS. Install with `pip install "linopy[gamspy]"`.
 - `Solver.from_file(name, problem_fn, options=...)` solves an existing LP/MPS file without a linopy model and leaves the file untouched. ([\#996](https://github.com/PyPSA/linopy/pull/996))
 - `LinearExpression.from_coo(model, coords, rows, vars, coeffs)` builds an expression from COO triplets (cell position, variable label, coefficient) on a coordinate grid.
 - `LinearExpression.to_coo()` returns the live terms of an expression as COO triplets, the counterpart of `from_coo`. A sparse expression is read without a dense copy. ([\#1156](https://github.com/PyPSA/linopy/pull/1156))

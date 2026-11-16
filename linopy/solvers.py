@@ -10,10 +10,12 @@ import enum
 import functools
 import io
 import logging
+import operator
 import os
 import queue
 import re
 import shutil
+import signal
 import subprocess as sub
 import sys
 import threading
@@ -5344,6 +5346,865 @@ class cuOpt(Solver[None]):
         super().close()
 
 
+# --------------------------------------------------------------------------
+# GAMSPy matrix model
+#
+# A generic GAMSPy model built from linopy's flat matrices.
+#
+# GAMS has no matrix interface: models are indexed equations over sets. A
+# :class:`GamsMatrixModel` therefore encodes a :class:`~linopy.matrices.Matrices`
+# as data. The columns form the set ``i`` and the rows the set ``j``; the
+# sparsity pattern of ``A`` is a static two-dimensional set and its values a
+# parameter, so one generic equation per constraint sign covers every row.
+#
+# GAMS fixes the type of a variable per symbol, not per element. Columns are
+# therefore grouped by kind into one variable symbol each (continuous, integer,
+# semi-continuous), and every matrix-valued piece of data (``A``, ``c``, ``Q``)
+# is split along the same groups.
+#
+# Keeping the pattern in sets rather than in ``$`` conditions on the values is
+# what allows a frozen GAMSPy model: the values can then be declared modifiable
+# and changed in place between solves.
+# --------------------------------------------------------------------------
+
+# GAMS variable type of each column group, keyed by group name.
+_GAMS_GROUP_TYPES: dict[str, str] = {"c": "free", "i": "integer", "s": "semicont"}
+# Column group of each linopy variable type (binaries are bounded integers).
+_GAMS_VTYPE_GROUPS: dict[str, str] = {"C": "c", "I": "i", "B": "i", "S": "s"}
+_GAMS_SIGNS: dict[str, str] = {"<": "le", ">": "ge", "=": "eq"}
+
+# Model statuses for which GAMS returns a primal point.
+_GAMS_STATUSES_WITH_SOLUTION = frozenset({1, 2, 3, 6, 7, 8, 9, 15, 16, 17})
+# Model attributes collected per GUSS scenario.
+_GUSS_REPORT = ("modelstat", "solvestat", "objval", "resusd")
+
+
+@dataclass
+class GamsScenarioUpdate:
+    """
+    Changes of one scenario against the built model, by column and row position.
+
+    Every field pairs positions with new values; ``bounds`` holds positions
+    with lower and upper bounds, ``coefficients`` rows, columns and values.
+    """
+
+    bounds: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+    rhs: tuple[np.ndarray, np.ndarray] | None = None
+    objective: tuple[np.ndarray, np.ndarray] | None = None
+    coefficients: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+
+
+@dataclass
+class GamsScenarioOutcome:
+    """What one GUSS scenario solve reported, by column and row position."""
+
+    model_status: int
+    solve_status: int
+    objective: float
+    primal: np.ndarray | None
+    dual: np.ndarray | None
+    runtime: float | None
+
+    @property
+    def has_solution(self) -> bool:
+        return self.model_status in _GAMS_STATUSES_WITH_SOLUTION
+
+
+@dataclass
+class _GamsGroup:
+    """The columns of one variable kind and the symbols defined over them."""
+
+    name: str
+    positions: np.ndarray
+    # GAMSPy symbols (typed Any: gamspy is an optional, lazily imported package)
+    var: Any
+    cols: Any
+    c: Any
+    nz: Any = None
+    A: Any = None
+    # entries of A in this group, sorted by their key ``row * n_cols + col``
+    keys: np.ndarray | None = None
+    rows: np.ndarray | None = None
+    cols_of_entries: np.ndarray | None = None
+    values: np.ndarray | None = None
+
+
+def _gams_total(terms: Iterable[Any]) -> Any:
+    """Sum of GAMSPy expressions, without the integer start value of ``sum``."""
+    return functools.reduce(operator.add, terms)
+
+
+def _gams_scatter(records: pd.DataFrame | None, column: str, size: int) -> np.ndarray:
+    """
+    Dense array of ``records[column]`` indexed by the integer element label.
+
+    GAMS omits records at their default value, so missing positions stay 0.
+    """
+    out = np.zeros(size, dtype=float)
+    if records is None or records.empty:
+        return out
+    labels = records.iloc[:, 0]
+    if isinstance(labels.dtype, pd.CategoricalDtype):
+        categories = labels.cat.categories.astype(np.int64)
+        positions = np.asarray(categories)[labels.cat.codes.to_numpy()]
+    else:
+        positions = labels.to_numpy().astype(np.int64)
+    out[positions] = records[column].to_numpy(dtype=float)
+    return out
+
+
+class GamsMatrixModel:
+    """
+    A GAMSPy container and model holding one linopy matrix problem.
+
+    Parameters
+    ----------
+    M : Matrices
+        The flat problem, in solver-scaled units.
+    sos : sequence of (type, positions, weights), optional
+        SOS sets over column positions.
+
+    Attributes
+    ----------
+    container : gamspy.Container
+        The GAMSPy container holding all symbols.
+    model : gamspy.Model
+        The GAMSPy model, solvable with any GAMS solver.
+    problem : str
+        GAMS model type: ``LP``, ``MIP``, ``QCP`` or ``MIQCP``.
+    """
+
+    def __init__(self, M: Matrices, *, sos: Sequence[SosSet] = ()) -> None:
+
+        self.n_cols = len(M.vlabels)
+        self.n_rows = len(M.clabels)
+        if not self.n_cols:
+            raise ValueError("Model has no variables, cannot export to GAMSPy.")
+        self.objective_sense = M.objective_sense
+        # Frozen-instance state; see freeze() and discard_start().
+        self.frozen = False
+        self.freeze_requested = False
+        self.cold_start = False
+        self._coefficients_changed = False
+        self._guss_runs = 0
+        self._frozen_with_coefficients = False
+        # Copies of the data that in-place updates rewrite symbol-wise.
+        self._lb = np.asarray(M.lb, dtype=float).copy()
+        self._ub = np.asarray(M.ub, dtype=float).copy()
+        self._c = np.asarray(M.c, dtype=float).copy()
+
+        size = max([self.n_cols, self.n_rows, len(sos), *(len(p) for _, p, _ in sos)])
+        # Element labels are the decimal positions, shared by every set so
+        # that GAMS orders them numerically wherever they appear.
+        self._uels = pd.Index(np.arange(size).astype(str))
+
+        # The GAMS process a container starts replaces the SIGINT handler of
+        # the whole Python process by one forwarding Ctrl-C to it, for good.
+        # It is only put in place while GAMS runs (see _forwarding_sigint).
+        ct, self._gams_sigint = self._capture_sigint(gamspy.Container)
+        self.container = ct
+        self.i = gamspy.Set(ct, "i", records=self._elements(np.arange(self.n_cols)))
+        self.j = gamspy.Set(ct, "j", records=self._elements(np.arange(self.n_rows)))
+        self.ii = gamspy.Alias(ct, "ii", self.i)
+
+        self._group_of = np.array(
+            [_GAMS_VTYPE_GROUPS[str(t)] for t in M.vtypes], dtype="U1"
+        )
+        self.groups: dict[str, _GamsGroup] = {}
+        for name in _GAMS_GROUP_TYPES:
+            positions = np.flatnonzero(self._group_of == name)
+            if positions.size:
+                self.groups[name] = self._add_group(name, positions, M)
+
+        A = M.A
+        self._row_nnz = np.zeros(self.n_rows, dtype=np.int64)
+        if A is not None and A.nnz:
+            self._add_matrix(A.tocsr())
+        self._b = np.asarray(M.b, dtype=float).copy()
+        # Rows without coefficients stay out of the equations (see
+        # trivially_infeasible), and out of b: a frozen instance rejects
+        # records it has no row for.
+        active = np.flatnonzero(self._row_nnz > 0)
+        self.b = gamspy.Parameter(
+            ct, "b", domain=self.j, records=self._values(active, self._b[active], "j")
+        )
+        self._sense = np.asarray(M.sense).astype("U1")
+
+        self.equations: dict[str, Any] = {}
+        for sign, suffix in _GAMS_SIGNS.items():
+            rows = np.flatnonzero((self._sense == sign) & (self._row_nnz > 0))
+            if rows.size:
+                self.equations[sign] = self._add_equation(sign, suffix, rows)
+
+        self.sos_equations: list[Any] = []
+        if sos:
+            self._add_sos(sos, M)
+
+        objective = self._objective(M)
+        discrete = bool(set(self.groups) - {"c"}) or bool(sos)
+        quadratic = M.Q is not None and M.Q.nnz > 0
+        if quadratic:
+            self.problem = "MIQCP" if discrete else "QCP"
+        else:
+            self.problem = "MIP" if discrete else "LP"
+        self.model = gamspy.Model(
+            ct,
+            "linopy",
+            equations=[*self.equations.values(), *self.sos_equations],
+            problem=self.problem,
+            sense="MAX" if M.objective_sense == "max" else "MIN",
+            objective=objective,
+        )
+
+    # ------------------------------------------------------------------ records
+
+    def _elements(self, positions: np.ndarray) -> pd.Categorical:
+        return pd.Categorical.from_codes(
+            np.asarray(positions, dtype=np.int64), categories=self._uels
+        )
+
+    def _values(
+        self, positions: np.ndarray, values: np.ndarray, dim: str
+    ) -> pd.DataFrame:
+        return pd.DataFrame(
+            {dim: self._elements(positions), "value": np.asarray(values, float)}
+        )
+
+    def _pairs(
+        self,
+        first: np.ndarray,
+        second: np.ndarray,
+        dims: tuple[str, str],
+        values: np.ndarray | None = None,
+    ) -> pd.DataFrame:
+        data: dict[str, Any] = {
+            dims[0]: self._elements(first),
+            dims[1]: self._elements(second),
+        }
+        if values is not None:
+            data["value"] = np.asarray(values, dtype=float)
+        return pd.DataFrame(data)
+
+    def _bounds(
+        self, positions: np.ndarray, lower: np.ndarray, upper: np.ndarray
+    ) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "i": self._elements(positions),
+                "lower": np.asarray(lower, dtype=float),
+                "upper": np.asarray(upper, dtype=float),
+            }
+        )
+
+    # ------------------------------------------------------------------- build
+
+    def _add_group(self, name: str, positions: np.ndarray, M: Matrices) -> _GamsGroup:
+
+        ct = self.container
+        cols = gamspy.Set(
+            ct, f"cols_{name}", domain=self.i, records=self._elements(positions)
+        )
+        var = gamspy.Variable(
+            ct, f"x_{name}", type=_GAMS_GROUP_TYPES[name], domain=self.i
+        )
+        var.setRecords(self._bounds(positions, M.lb[positions], M.ub[positions]))
+        c = gamspy.Parameter(
+            ct,
+            f"c_{name}",
+            domain=self.i,
+            records=self._values(positions, M.c[positions], "i"),
+        )
+        return _GamsGroup(name, positions, var, cols, c)
+
+    def _add_matrix(self, A: Any) -> None:
+
+        rows = np.repeat(np.arange(A.shape[0]), np.diff(A.indptr))
+        cols = np.asarray(A.indices)
+        data = np.asarray(A.data, dtype=float)
+        np.add.at(self._row_nnz, rows, 1)
+        group_of_entry = self._group_of[cols]
+        for name, group in self.groups.items():
+            mask = group_of_entry == name
+            if not mask.any():
+                continue
+            keys = rows[mask] * self.n_cols + cols[mask]
+            order = np.argsort(keys, kind="stable")
+            group.keys = keys[order]
+            group.rows = rows[mask][order]
+            group.cols_of_entries = cols[mask][order]
+            group.values = data[mask][order]
+            group.nz = gamspy.Set(
+                self.container,
+                f"nz_{name}",
+                domain=[self.j, self.i],
+                records=self._pairs(rows[mask], cols[mask], ("j", "i")),
+            )
+            group.A = gamspy.Parameter(
+                self.container,
+                f"A_{name}",
+                domain=[self.j, self.i],
+                records=self._pairs(rows[mask], cols[mask], ("j", "i"), data[mask]),
+            )
+
+    def _add_equation(self, sign: str, suffix: str, rows: np.ndarray) -> Any:
+
+        ct = self.container
+        js = gamspy.Set(
+            ct, f"rows_{suffix}", domain=self.j, records=self._elements(rows)
+        )
+        eq = gamspy.Equation(ct, f"e_{suffix}", domain=self.j)
+        lhs = _gams_total(
+            gamspy.Sum(g.nz[js, self.i], g.A[js, self.i] * g.var[self.i])
+            for g in self.groups.values()
+            if g.nz is not None and g.A is not None
+        )
+        if sign == "<":
+            eq[js] = lhs <= self.b[js]
+        elif sign == ">":
+            eq[js] = lhs >= self.b[js]
+        else:
+            eq[js] = lhs == self.b[js]
+        return eq
+
+    def _add_sos(self, sos: Sequence[SosSet], M: Matrices) -> None:
+        """
+        Add SOS1/SOS2 sets through auxiliary SOS variables linked to the columns.
+
+        GAMS declares SOS membership by variable type, with the last index
+        running over the members of one set. Each linopy set becomes a row
+        ``k`` of an auxiliary ``x_sos{type}(k, m)`` variable, whose member index
+        ``m`` is the rank by weight, since SOS2 adjacency follows the element
+        order. An equality ties every member to its column; the auxiliary
+        variables are free, so the column keeps its own bounds.
+        """
+
+        ct = self.container
+        k = gamspy.Set(ct, "sos_k", records=self._elements(np.arange(len(sos))))
+        m = gamspy.Set(
+            ct,
+            "sos_m",
+            records=self._elements(np.arange(max(len(p) for _, p, _ in sos))),
+        )
+        for sos_type in sorted({t for t, _, _ in sos}):
+            members = [
+                (index, positions[np.argsort(weights, kind="stable")])
+                for index, (t, positions, weights) in enumerate(sos)
+                if t == sos_type
+            ]
+            set_index = np.concatenate([np.full(p.size, index) for index, p in members])
+            rank = np.concatenate([np.arange(p.size) for _, p in members])
+            column = np.concatenate([p for _, p in members])
+
+            var = gamspy.Variable(
+                ct, f"x_sos{sos_type}", type=f"sos{sos_type}", domain=[k, m]
+            )
+            var.setRecords(
+                pd.DataFrame(
+                    {
+                        "sos_k": self._elements(set_index),
+                        "sos_m": self._elements(rank),
+                        "lower": -np.inf,
+                        "upper": np.inf,
+                    }
+                )
+            )
+            group_of_member = self._group_of[column]
+            for name, group in self.groups.items():
+                mask = group_of_member == name
+                if not mask.any():
+                    continue
+                link = gamspy.Set(
+                    ct,
+                    f"sos{sos_type}_map_{name}",
+                    domain=[k, m, self.i],
+                    records=pd.DataFrame(
+                        {
+                            "sos_k": self._elements(set_index[mask]),
+                            "sos_m": self._elements(rank[mask]),
+                            "i": self._elements(column[mask]),
+                        }
+                    ),
+                )
+                eq = gamspy.Equation(
+                    ct, f"sos{sos_type}_link_{name}", domain=[k, m, self.i]
+                )
+                eq[k, m, self.i].where[link[k, m, self.i]] = (
+                    var[k, m] == group.var[self.i]
+                )
+                self.sos_equations.append(eq)
+
+    def _objective(self, M: Matrices) -> Any:
+
+        terms: list[Any] = [
+            gamspy.Sum(g.cols, g.c[g.cols] * g.var[g.cols])
+            for g in self.groups.values()
+        ]
+        if M.Q is not None and M.Q.nnz:
+            Q = M.Q.tocoo()
+            rows, cols, data = (
+                np.asarray(Q.row),
+                np.asarray(Q.col),
+                np.asarray(Q.data, float),
+            )
+            keep = data != 0
+            rows, cols, data = rows[keep], cols[keep], data[keep]
+            row_group, col_group = self._group_of[rows], self._group_of[cols]
+            for gk, first in self.groups.items():
+                for gl, second in self.groups.items():
+                    mask = (row_group == gk) & (col_group == gl)
+                    if not mask.any():
+                        continue
+                    pairs = (rows[mask], cols[mask], ("i", "ii"))
+                    qnz = gamspy.Set(
+                        self.container,
+                        f"qnz_{gk}{gl}",
+                        domain=[self.i, self.ii],
+                        records=self._pairs(*pairs),
+                    )
+                    q = gamspy.Parameter(
+                        self.container,
+                        f"Q_{gk}{gl}",
+                        domain=[self.i, self.ii],
+                        records=self._pairs(*pairs, data[mask]),
+                    )
+                    terms.append(
+                        0.5
+                        * gamspy.Sum(
+                            qnz[self.i, self.ii],
+                            q[self.i, self.ii]
+                            * first.var[self.i]
+                            * second.var[self.ii],
+                        )
+                    )
+        return _gams_total(terms)
+
+    # ------------------------------------------------------------------- solve
+
+    def trivially_infeasible(self, tol: float = 1e-9) -> bool:
+        """
+        Whether a row without coefficients cannot hold.
+
+        Such rows are left out of the GAMS equations, where GAMS would abort
+        with an execution error instead of reporting infeasibility.
+        """
+        return self._violates_empty_rows(self._b, tol)
+
+    def _violates_empty_rows(self, b: np.ndarray, tol: float = 1e-9) -> bool:
+        empty = self._row_nnz == 0
+        if not empty.any():
+            return False
+        b, sense = b[empty], self._sense[empty]
+        violated = (
+            ((sense == "<") & (b < -tol))
+            | ((sense == ">") & (b > tol))
+            | ((sense == "=") & (np.abs(b) > tol))
+        )
+        return bool(violated.any())
+
+    @staticmethod
+    def _capture_sigint(start: Callable[[], Any]) -> tuple[Any, Any]:
+        """Call ``start``, undo the SIGINT handler it installs and return both."""
+        if threading.current_thread() is not threading.main_thread():
+            return start(), None
+        previous = signal.getsignal(signal.SIGINT)
+        try:
+            result = start()
+            installed = signal.getsignal(signal.SIGINT)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        return result, None if installed is previous else installed
+
+    @contextlib.contextmanager
+    def _forwarding_sigint(self) -> Iterator[None]:
+        """Let Ctrl-C reach GAMS while it runs, then restore the caller's handler."""
+        if (
+            self._gams_sigint is None
+            or threading.current_thread() is not threading.main_thread()
+        ):
+            yield
+            return
+        previous = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, self._gams_sigint)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+    def solve(self, **kwargs: Any) -> Any:
+        """Solve the GAMSPy model; keyword arguments go to ``gamspy.Model.solve``."""
+        with self._forwarding_sigint():
+            return self.model.solve(**kwargs)
+
+    # ---------------------------------------------------------- in-place updates
+
+    def set_bounds(
+        self, positions: np.ndarray, lower: np.ndarray, upper: np.ndarray
+    ) -> None:
+        """Change the bounds of the columns at ``positions``."""
+        self._lb[positions] = lower
+        self._ub[positions] = upper
+        for g in self._groups_of(positions):
+            g.var.setRecords(
+                self._bounds(g.positions, self._lb[g.positions], self._ub[g.positions])
+            )
+
+    def set_rhs(self, rows: np.ndarray, values: np.ndarray) -> None:
+        """Change the right-hand side of the rows at ``rows``."""
+        self._b[rows] = values
+        active = np.flatnonzero(self._row_nnz > 0)
+        self.b.setRecords(self._values(active, self._b[active], "j"))
+
+    def set_objective(self, positions: np.ndarray, values: np.ndarray) -> None:
+        """Change the linear objective coefficients of the columns at ``positions``."""
+        self._c[positions] = values
+        for g in self._groups_of(positions):
+            g.c.setRecords(self._values(g.positions, self._c[g.positions], "i"))
+
+    def _locate(
+        self, rows: np.ndarray, cols: np.ndarray
+    ) -> list[tuple[_GamsGroup, np.ndarray, np.ndarray]]:
+        """Per group: which of the entries lie in it, and their slots there."""
+        keys = np.asarray(rows, dtype=np.int64) * self.n_cols + np.asarray(cols)
+        group_of_entry = self._group_of[np.asarray(cols)]
+        found = []
+        for name, g in self.groups.items():
+            mask = group_of_entry == name
+            if not mask.any() or g.keys is None:
+                found.append((g, mask, np.full(int(mask.sum()), -1)))
+                continue
+            slots = np.searchsorted(g.keys, keys[mask])
+            slots[slots >= g.keys.size] = 0
+            slots[g.keys[slots] != keys[mask]] = -1
+            found.append((g, mask, slots))
+        return found
+
+    def in_pattern(
+        self, rows: np.ndarray, cols: np.ndarray, values: np.ndarray
+    ) -> bool:
+        """
+        Whether all non-zero entries lie in the sparsity pattern of ``A``.
+
+        The pattern is fixed when the model is built; zeros outside it are
+        no-ops and need no slot.
+        """
+        values = np.asarray(values)
+        for _, mask, slots in self._locate(rows, cols):
+            if ((slots < 0) & (values[mask] != 0)).any():
+                return False
+        return True
+
+    def set_coefficients(
+        self, rows: np.ndarray, cols: np.ndarray, values: np.ndarray
+    ) -> None:
+        """Change entries of ``A`` within its pattern (see :meth:`in_pattern`)."""
+        values = np.asarray(values, dtype=float)
+        for g, mask, slots in self._locate(rows, cols):
+            hit = slots >= 0
+            if not hit.any():
+                continue
+            assert g.values is not None and g.A is not None
+            assert g.rows is not None and g.cols_of_entries is not None
+            g.values[slots[hit]] = values[mask][hit]
+            self._coefficients_changed = True
+            g.A.setRecords(self._pairs(g.rows, g.cols_of_entries, ("j", "i"), g.values))
+
+    def set_sense(self, sense: str) -> None:
+        """
+        Change the objective sense to ``"min"`` or ``"max"``.
+
+        A frozen instance fixes the sense, so it is released; the next
+        :meth:`freeze` generates it again.
+        """
+
+        self.close()
+        self.model.sense = gamspy.Sense.MAX if sense == "max" else gamspy.Sense.MIN
+        self.objective_sense = sense
+
+    def _groups_of(self, positions: np.ndarray) -> list[_GamsGroup]:
+        names = set(np.unique(self._group_of[np.asarray(positions)]).tolist())
+        return [g for name, g in self.groups.items() if name in names]
+
+    def freeze(self) -> None:
+        """
+        Freeze the model, so that later solves update the generated instance.
+
+        The data that :meth:`set_bounds`, :meth:`set_rhs` and
+        :meth:`set_objective` change is declared modifiable, which saves GAMS
+        the model generation on every solve. The matrix ``A`` is only declared
+        modifiable once :meth:`set_coefficients` has changed it: GAMS generates
+        a modifiable coefficient as a placeholder, which makes the instance
+        larger, so a model whose coefficients never change is frozen without.
+        Calling it again refreezes only when ``A`` has to be added.
+        """
+        coefficients = self._coefficients_changed
+        if self.frozen and (self._frozen_with_coefficients or not coefficients):
+            return
+        self.close()
+        modifiables: list[Any] = [self.b]
+        for g in self.groups.values():
+            modifiables += [g.c, g.var.lo, g.var.up]
+            if coefficients and g.A is not None:
+                modifiables.append(g.A)
+        with self._forwarding_sigint():
+            self.model.freeze(modifiables=modifiables)
+        self.frozen = True
+        self._frozen_with_coefficients = coefficients
+
+    def solve_scenarios(
+        self, updates: Sequence[GamsScenarioUpdate], **kwargs: Any
+    ) -> list[GamsScenarioOutcome]:
+        """
+        Solve one variant of the model per update in a single GAMS run (GUSS).
+
+        Scenario data only lists the changed entries; GUSS takes all others
+        from the built model (``UpdateType=1``). Symbols no scenario changes
+        are left out, so ``A`` only becomes scenario data when coefficients
+        differ. Keyword arguments go to ``gamspy.Model.solve``.
+        """
+
+        self.close()  # GUSS does not run on a frozen instance
+        self._guss_runs += 1
+        prefix = f"guss{self._guss_runs}"
+        ct = self.container
+        n = len(updates)
+        scenarios = pd.Index(np.arange(n).astype(str))
+        s = gamspy.Set(ct, f"{prefix}_s", records=scenarios)
+        guss = gamspy.GUSSScenarioDict(ct, f"{prefix}_dict", s)
+        temporary: list[Any] = []  # parameters, cleared after the run
+
+        def scenario_data(
+            name: str, domain: list[Any], parts: list[tuple[int, list[Any]]]
+        ) -> Any | None:
+            """A parameter over (scenario, *domain) from per-scenario columns."""
+            parts = [(k, cols) for k, cols in parts if len(cols[0])]
+            if not parts:
+                return None
+            data: dict[str, Any] = {
+                s.name: pd.Categorical.from_codes(
+                    np.concatenate(
+                        [np.full(len(cols[0]), k, dtype=np.int64) for k, cols in parts]
+                    ),
+                    categories=scenarios,
+                )
+            }
+            for d, dim in enumerate(domain):
+                data[dim.name] = self._elements(
+                    np.concatenate([cols[d] for _, cols in parts])
+                )
+            data["value"] = np.concatenate([cols[-1] for _, cols in parts])
+            param = gamspy.Parameter(
+                ct, f"{prefix}_{name}", domain=[s, *domain], records=pd.DataFrame(data)
+            )
+            temporary.append(param)
+            return param
+
+        # inputs: per symbol, the changed entries of each scenario
+        inputs: list[tuple[Any, Any, str, list[Any], list[Any]]] = []
+        rhs_parts = []
+        active = self._row_nnz > 0
+        for k, u in enumerate(updates):
+            if u.rhs is not None:
+                rows, values = np.asarray(u.rhs[0]), np.asarray(u.rhs[1], float)
+                keep = active[rows]
+                rhs_parts.append((k, [rows[keep], values[keep]]))
+        inputs.append((guss.add_param, self.b, "b", [self.j], rhs_parts))
+
+        costs: dict[str, list[Any]] = {}
+        for name, g in self.groups.items():
+            lower, upper, cost, coef = [], [], [], []
+            for k, u in enumerate(updates):
+                if u.bounds is not None:
+                    pos = np.asarray(u.bounds[0])
+                    mine = self._group_of[pos] == name
+                    lower.append((k, [pos[mine], np.asarray(u.bounds[1])[mine]]))
+                    upper.append((k, [pos[mine], np.asarray(u.bounds[2])[mine]]))
+                if u.objective is not None:
+                    pos = np.asarray(u.objective[0])
+                    mine = self._group_of[pos] == name
+                    cost.append((k, [pos[mine], np.asarray(u.objective[1])[mine]]))
+                if u.coefficients is not None and g.keys is not None:
+                    rows, cols, values = (np.asarray(a) for a in u.coefficients)
+                    for group, mask, slots in self._locate(rows, cols):
+                        if group is g:
+                            hit = slots >= 0
+                            entries = [rows[mask][hit], cols[mask][hit]]
+                            entries.append(np.asarray(values, float)[mask][hit])
+                            coef.append((k, entries))
+            costs[name] = cost
+            inputs += [
+                (guss.add_lower, g.var, f"lo_{name}", [self.i], lower),
+                (guss.add_upper, g.var, f"up_{name}", [self.i], upper),
+                (guss.add_param, g.c, f"c_{name}", [self.i], cost),
+            ]
+            if g.A is not None:
+                inputs.append(
+                    (guss.add_param, g.A, f"A_{name}", [self.j, self.i], coef)
+                )
+
+        # GUSS fails on a scenario without any record, so such a scenario
+        # restates the base cost of the first column instead.
+        touched = {k for *_, parts in inputs for k, cols in parts if len(cols[0])}
+        name, g = next(iter(self.groups.items()))
+        pos = g.positions[:1]
+        costs[name] += [(k, [pos, self._c[pos]]) for k in range(n) if k not in touched]
+
+        for add, target, symbol, domain, parts in inputs:
+            if (param := scenario_data(symbol, domain, parts)) is not None:
+                add(target, param)
+
+        # outputs
+        levels = {}
+        for name, g in self.groups.items():
+            levels[name] = gamspy.Parameter(
+                ct, f"{prefix}_x_{name}", domain=[s, self.i]
+            )
+            guss.add_level(g.var, levels[name])
+        marginals = []
+        if not self.problem.startswith("MI"):
+            for sign, eq in self.equations.items():
+                param = gamspy.Parameter(
+                    ct, f"{prefix}_m_{_GAMS_SIGNS[sign]}", domain=[s, self.j]
+                )
+                guss.add_marginal(eq, param)
+                marginals.append(param)
+        attrs = gamspy.Set(ct, f"{prefix}_attrs", records=list(_GUSS_REPORT))
+        report = gamspy.Parameter(ct, f"{prefix}_report", domain=[s, attrs])
+        options = gamspy.Parameter(
+            ct,
+            f"{prefix}_options",
+            domain="*",
+            records=[("UpdateType", 1), ("SkipBaseCase", 1)],
+        )
+        guss.add_options(options, report)
+        temporary += [*levels.values(), *marginals, report, options]
+
+        with self._forwarding_sigint():
+            self.model.solve(scenario=guss, **kwargs)
+
+        outcomes = self._scenario_outcomes(
+            updates, report, levels, marginals, scenarios
+        )
+        for symbol in temporary:
+            # free the data; GAMSPy cannot drop symbols, nor GAMS clear the
+            # (small) sets that are domains
+            symbol.setRecords(None)
+        return outcomes
+
+    def _scenario_outcomes(
+        self,
+        updates: Sequence[GamsScenarioUpdate],
+        report: Any,
+        levels: dict[str, Any],
+        marginals: list[Any],
+        scenarios: pd.Index,
+    ) -> list[GamsScenarioOutcome]:
+        def per_scenario(param: Any) -> dict[int, pd.DataFrame]:
+            records = param.records
+            if records is None or records.empty:
+                return {}
+            keys = records.iloc[:, 0].astype(str).astype(np.int64)
+            return {
+                int(k): frame.iloc[:, 1:]
+                for k, frame in records.groupby(keys.to_numpy())
+            }
+
+        reported: dict[int, dict[str, float]] = {}
+        for k, frame in per_scenario(report).items():
+            reported[k] = dict(
+                zip(frame.iloc[:, 0].astype(str), frame["value"].astype(float))
+            )
+        level_frames = {name: per_scenario(p) for name, p in levels.items()}
+        marginal_frames = [per_scenario(p) for p in marginals]
+
+        outcomes = []
+        for k, update in enumerate(updates):
+            attrs = reported.get(k, {})
+            b = self._b
+            if update.rhs is not None:
+                b = b.copy()
+                b[np.asarray(update.rhs[0])] = update.rhs[1]
+            if self._violates_empty_rows(b):
+                outcomes.append(GamsScenarioOutcome(19, 1, np.nan, None, None, None))
+                continue
+            outcome = GamsScenarioOutcome(
+                model_status=int(attrs.get("modelstat", 0)),
+                solve_status=int(attrs.get("solvestat", 0)),
+                objective=float(attrs.get("objval", np.nan)),
+                primal=None,
+                dual=None,
+                runtime=attrs.get("resusd"),
+            )
+            if outcome.has_solution:
+                primal = np.zeros(self.n_cols)
+                for name, g in self.groups.items():
+                    values = _gams_scatter(
+                        level_frames[name].get(k), "value", self.n_cols
+                    )
+                    primal[g.positions] = values[g.positions]
+                outcome.primal = primal
+                if marginals:
+                    dual = np.zeros(self.n_rows)
+                    for frames in marginal_frames:
+                        dual += _gams_scatter(frames.get(k), "value", self.n_rows)
+                    outcome.dual = dual
+            outcomes.append(outcome)
+        return outcomes
+
+    def discard_start(self) -> None:
+        """
+        Make the next solve start from scratch instead of the last solution.
+
+        A frozen instance always restarts from its last solution, so it is
+        released; the next solve then generates the model anew and rejects
+        any advanced basis (``basis_detection_threshold=1``, GAMS ``bratio``).
+        """
+        self.close()
+        self.cold_start = True
+
+    def close(self) -> None:
+        """Release the frozen model instance, if any."""
+        if self.frozen:
+            self.model.unfreeze()
+            self.frozen = False
+
+    def _attribute(self, name: str) -> Any:
+        """A model attribute, or None while GAMSPy has no results (yet)."""
+        try:
+            return getattr(self.model, name)
+        except Exception:
+            return None
+
+    @property
+    def model_status(self) -> Any:
+        """The ``gamspy.ModelStatus`` of the last solve, if any."""
+        return self._attribute("status")
+
+    @property
+    def solve_status(self) -> Any:
+        """The ``gamspy.SolveStatus`` of the last solve, if any."""
+        return self._attribute("solve_status")
+
+    @property
+    def has_solution(self) -> bool:
+        status = self.model_status
+        return status is not None and status.value in _GAMS_STATUSES_WITH_SOLUTION
+
+    def primal(self) -> np.ndarray:
+        """Column values by position."""
+        out = np.zeros(self.n_cols, dtype=float)
+        for g in self.groups.values():
+            values = _gams_scatter(g.var.records, "level", self.n_cols)
+            out[g.positions] = values[g.positions]
+        return out
+
+    def dual(self) -> np.ndarray:
+        """Row marginals by position; rows without coefficients get 0."""
+        out = np.zeros(self.n_rows, dtype=float)
+        for eq in self.equations.values():
+            out += _gams_scatter(eq.records, "marginal", self.n_rows)
+        return out
+
+
 def _gamspy_termination_condition(
     model_status: Any, solve_status: Any
 ) -> TerminationCondition:
@@ -5417,6 +6278,13 @@ class GAMSPy(Solver[None]):
       ``log_fn`` writes the log to a file instead.
     * ``freeze`` : whether to freeze the GAMS model on its first in-place
       update (default ``True``), so that later solves skip model generation.
+      Only local solves freeze.
+    * ``backend`` and ``client`` : where GAMS runs, ``"local"`` (default),
+      ``"engine"`` with a ``gamspy.EngineClient`` or ``"neos"`` with a
+      ``gamspy.NeosClient``. NEOS sends the model to an external service.
+
+    :meth:`solve_scenarios` solves many variants of the built model in a
+    single GAMS run (GUSS).
 
     In-place updates (``Solver(..., track_updates=True)`` or matrix windows)
     change variable bounds, right-hand sides, linear objective coefficients
@@ -5503,7 +6371,6 @@ class GAMSPy(Solver[None]):
 
     @classmethod
     def _license_probe(cls) -> None:
-        from linopy.gamspy_model import GamsMatrixModel
         from linopy.matrices import Matrices
 
         M = Matrices(
@@ -5530,7 +6397,7 @@ class GAMSPy(Solver[None]):
         gm = GamsMatrixModel(M)
         gm.solve()
         if not gm.has_solution:
-            raise RuntimeError(f"GAMSPy probe solve failed: {gm.model.status}")
+            raise RuntimeError(f"GAMSPy probe solve failed: {gm.model_status}")
 
     def _build_file(self, **build_kwargs: Any) -> None:
         """Redirect a file-based build onto the direct API; GAMS reads no LP files."""
@@ -5559,9 +6426,114 @@ class GAMSPy(Solver[None]):
         sos: list[SosSet],
         **kwargs: Any,
     ) -> Any:
-        from linopy.gamspy_model import GamsMatrixModel
 
         return GamsMatrixModel(M, sos=sos)
+
+    def solve_scenarios(
+        self, models: Sequence[Model], ignore_dims: Iterable[str] = ()
+    ) -> list[Result]:
+        """
+        Solve variants of the built model in a single GAMS run (GUSS).
+
+        Each model must differ from the one the solver was built for only in
+        what an in-place update can change: variable bounds, right-hand sides,
+        linear objective coefficients and matrix coefficients within the
+        sparsity pattern. GAMS then generates the model once and solves every
+        variant from the changed data alone.
+
+        Parameters
+        ----------
+        models : sequence of Model
+            The variants, structurally identical to the built model.
+        ignore_dims : iterable of str
+            Dims whose coordinates may differ, as for :meth:`Solver.update`.
+
+        Returns
+        -------
+        list of Result
+            One result per model, in order, for ``Model.assign_result``.
+
+        Raises
+        ------
+        ValueError
+            If a model changes anything else; solve it separately instead.
+        """
+        if self.io_api != "direct" or self.solver_model is None:
+            raise RuntimeError(
+                "solve_scenarios needs a solver built with io_api='direct'."
+            )
+        updates = []
+        for k, model in enumerate(models):
+            diff = self._compute_diff(model, ignore_dims, same_model=False)
+            try:
+                if isinstance(diff, RebuildReason):
+                    raise UnsupportedUpdate(diff.value)
+                self._validate_update(diff)
+                if diff.obj_sense is not None:
+                    raise UnsupportedUpdate("the objective sense differs")
+            except UnsupportedUpdate as exc:
+                raise ValueError(
+                    f"Model {k} is no variant of the built model: {exc}"
+                ) from exc
+            updates.append(
+                GamsScenarioUpdate(
+                    bounds=(
+                        diff.var_bounds_indices,
+                        diff.var_bounds_lower,
+                        diff.var_bounds_upper,
+                    ),
+                    rhs=(diff.con_rhs_indices, diff.con_rhs_values),
+                    objective=(
+                        (diff.obj_c_indices, diff.obj_c_values)
+                        if diff.obj_c_indices is not None
+                        and diff.obj_c_values is not None
+                        else None
+                    ),
+                    coefficients=(
+                        (diff.con_coef_rows, diff.con_coef_cols, diff.con_coef_vals)
+                        if diff.n_coef_updates
+                        else None
+                    ),
+                )
+            )
+
+        with self._lock:
+            gm = self.solver_model
+            outcomes = gm.solve_scenarios(updates, **self._split_options())
+
+        results = []
+        for outcome in outcomes:
+            condition = _gamspy_termination_condition(
+                gamspy.ModelStatus(outcome.model_status),
+                gamspy.SolveStatus(outcome.solve_status),
+            )
+            status = Status.from_termination_condition(condition)
+            status.legacy_status = (
+                f"ModelStatus {outcome.model_status}, "
+                f"SolveStatus {outcome.solve_status}"
+            )
+            solution = Solution()
+            if status.is_ok and outcome.primal is not None:
+                dual = (
+                    _solution_from_labels(outcome.dual, self._clabels, self._n_cons)
+                    if outcome.dual is not None
+                    else np.array([], dtype=float)
+                )
+                solution = Solution(
+                    _solution_from_labels(outcome.primal, self._vlabels, self._n_vars),
+                    dual,
+                    outcome.objective,
+                )
+            results.append(
+                Result(
+                    status=status,
+                    solution=solution,
+                    solver_model=gm,
+                    solver_name=self.solver_name.value,
+                    report=SolverReport(runtime=outcome.runtime),
+                )
+            )
+        return results
 
     def _split_options(self, cold_start: bool = False) -> dict[str, Any]:
         """Sort the solver options into keyword arguments of ``gamspy.Model.solve``."""
@@ -5573,6 +6545,9 @@ class GAMSPy(Solver[None]):
             solve_kwargs["solver"] = name
         if (output := opts.pop("output", None)) is not None:
             solve_kwargs["output"] = output
+        for key in ("backend", "client"):
+            if (value := opts.pop(key, None)) is not None:
+                solve_kwargs[key] = value
         opts.pop("freeze", None)
         solver_options = dict(opts.pop("solver_options", None) or {})
         fields = gamspy.Options.model_fields
@@ -5606,7 +6581,7 @@ class GAMSPy(Solver[None]):
         solve_kwargs = self._split_options(cold_start=gm.cold_start)
         if gm.cold_start:
             gm.cold_start = False
-        elif gm.freeze_requested:
+        elif gm.freeze_requested and solve_kwargs.get("backend", "local") == "local":
             gm.freeze()
 
         if gm.trivially_infeasible():
@@ -5622,9 +6597,9 @@ class GAMSPy(Solver[None]):
             gm.solve(**solve_kwargs)
 
         mdl = gm.model
-        condition = _gamspy_termination_condition(mdl.status, mdl.solve_status)
+        condition = _gamspy_termination_condition(gm.model_status, gm.solve_status)
         status = Status.from_termination_condition(condition)
-        status.legacy_status = f"{mdl.status}, {mdl.solve_status}"
+        status.legacy_status = f"{gm.model_status}, {gm.solve_status}"
 
         def get_solver_solution() -> Solution:
             if not gm.has_solution:

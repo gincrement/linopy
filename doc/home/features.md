@@ -32,6 +32,7 @@ flexible data-handling features:
     - [MOSEK](https://www.mosek.com/)
     - [COPT](https://www.shanshu.ai/copt)
     - [Knitro](https://www.artelys.com/solvers/knitro/)
+    - [GAMSPy](https://gamspy.readthedocs.io/) (any solver of a GAMS system)
     - [cuOpt](https://docs.nvidia.com/cuopt/) (GPU-accelerated)
     - [cuPDLPx](https://github.com/MIT-Lu-Lab/cuPDLPx) (GPU-accelerated)
 

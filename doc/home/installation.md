@@ -62,6 +62,21 @@ We recommend the HiGHS solver, which is free, open source, and fast
 across a wide range of problem sizes. It is included in both the
 `solvers` and `dev` extras.
 
+### Solvers of a GAMS system
+
+[GAMSPy](https://gamspy.readthedocs.io/) gives access to every solver of a
+GAMS system, e.g. CPLEX, Gurobi, Xpress, MOSEK, BARON or HiGHS, under a single
+GAMS license:
+
+```bash
+uv pip install "linopy[gamspy]"
+```
+
+Select the GAMS solver with the `solver` option, e.g.
+`m.solve("gamspy", solver="cplex")`. The license bundled with GAMSPy limits
+models to 2,000 rows and columns; see the GAMSPy documentation for licenses
+and for installing further solvers (`gamspy install solver <name>`).
+
 ### GPU-accelerated solvers
 
 For large-scale optimization problems, GPU-accelerated solvers can provide significant performance improvements:
