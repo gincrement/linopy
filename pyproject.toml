@@ -112,6 +112,10 @@ spec = [
     "mathspec @ git+https://github.com/energy-models/mathspec.git@cc531151128e63af592628b697dd44ab93a1795a ; python_version >= '3.12'",
     "pyarrow",
 ]
+# GAMSPy pulls in a GAMS system (gamspy_base), kept separate to avoid env clutter.
+gamspy = [
+    "gamspy>=1.30.0",
+]
 # GPU-only solvers kept separate to avoid env clutter.
 # Requires a CUDA 12 driver (>= 525.60.13) and GPU of compute capability >= 7.0.
 gpu = [

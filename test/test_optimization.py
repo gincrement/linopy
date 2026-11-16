@@ -567,6 +567,7 @@ def test_solver_time_limit_options(
         "copt": {"TimeLimit": 1},
         "cupdlpx": {"TimeLimit": 1},
         "cuopt": {"time_limit": 1},
+        "gamspy": {"time_limit": 1},
     }
     status, condition = model.solve(
         solver,
@@ -1059,6 +1060,7 @@ def test_basis_and_warmstart(
             "and a non-file payload, and setting an initial solution crashes the "
             "CUDA context, so linopy does not offer it. See doc/gpu-acceleration.rst."
         ),
+        "gamspy": "GAMSPy does not read or write basis files.",
     }
     if solver in no_warmstart_reasons:
         pytest.skip(no_warmstart_reasons[solver])

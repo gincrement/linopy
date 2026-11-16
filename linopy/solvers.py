@@ -321,6 +321,7 @@ mindoptpy = _LazyModule("mindoptpy")
 coptpy = _LazyModule("coptpy")
 cupdlpx = _LazyModule("cupdlpx")
 cuopt = _LazyModule("cuopt")
+gamspy = _LazyModule("gamspy")
 
 
 def _has_module(name: str) -> bool:
@@ -377,6 +378,7 @@ class SolverName(enum.Enum):
     PIPS = "pips"
     cuPDLPx = "cupdlpx"
     cuOpt = "cuopt"
+    GAMSPy = "gamspy"
 
 
 def path_to_string(path: Path) -> str:
@@ -5342,6 +5344,258 @@ class cuOpt(Solver[None]):
         super().close()
 
 
+def _gamspy_termination_condition(
+    model_status: Any, solve_status: Any
+) -> TerminationCondition:
+    """Map GAMSPy's ModelStatus and SolveStatus onto a termination condition."""
+    # https://gamspy.readthedocs.io/en/latest/user/notebooks/model_status.html
+    SOLVE_STATUS_MAP: dict[int, TerminationCondition] = {
+        2: TerminationCondition.iteration_limit,
+        3: TerminationCondition.time_limit,
+        4: TerminationCondition.terminated_by_limit,
+        5: TerminationCondition.internal_solver_error,
+        6: TerminationCondition.internal_solver_error,
+        7: TerminationCondition.licensing_problems,
+        8: TerminationCondition.user_interrupt,
+        9: TerminationCondition.internal_solver_error,
+        10: TerminationCondition.internal_solver_error,
+        11: TerminationCondition.internal_solver_error,
+        12: TerminationCondition.unknown,
+        13: TerminationCondition.internal_solver_error,
+    }
+    MODEL_STATUS_MAP: dict[int, TerminationCondition] = {
+        0: TerminationCondition.unknown,
+        1: TerminationCondition.optimal,
+        2: TerminationCondition.optimal,
+        3: TerminationCondition.unbounded,
+        4: TerminationCondition.infeasible,
+        5: TerminationCondition.infeasible,
+        6: TerminationCondition.infeasible,
+        7: TerminationCondition.suboptimal,
+        # a MIP solved to the relative/absolute gap tolerance
+        8: TerminationCondition.optimal,
+        9: TerminationCondition.unknown,
+        10: TerminationCondition.infeasible,
+        11: TerminationCondition.licensing_problems,
+        12: TerminationCondition.internal_solver_error,
+        13: TerminationCondition.internal_solver_error,
+        14: TerminationCondition.unknown,
+        15: TerminationCondition.optimal,
+        16: TerminationCondition.optimal,
+        17: TerminationCondition.optimal,
+        18: TerminationCondition.unbounded,
+        19: TerminationCondition.infeasible,
+    }
+    if solve_status is not None and solve_status.value in SOLVE_STATUS_MAP:
+        return SOLVE_STATUS_MAP[solve_status.value]
+    if model_status is None:
+        return TerminationCondition.unknown
+    return MODEL_STATUS_MAP.get(model_status.value, TerminationCondition.unknown)
+
+
+class GAMSPy(Solver[None]):
+    """
+    Solver subclass for GAMSPy, which solves with any solver of a GAMS system.
+
+    GAMSPy must be installed for usage (``pip install gamspy``). Its bundled
+    license is size limited; see https://gamspy.readthedocs.io/ for licenses
+    and for installing further solvers (``gamspy install solver <name>``).
+
+    The model is passed as data: a generic GAMS model over a column and a row
+    set whose coefficients are parameters, so nothing is written to an LP or
+    MPS file.
+
+    Options are split by name:
+
+    * ``solver`` : the GAMS solver to use, e.g. ``"cplex"`` or ``"highs"``.
+      Defaults to the GAMS default solver for the problem type.
+    * Fields of :class:`gamspy.Options` (``time_limit``, ``threads``,
+      ``relative_optimality_gap``, ...) are passed as GAMS options.
+    * ``solver_options`` : a dict written to the solver's option file.
+      Any other option is added to it as well.
+    * ``output`` : a text stream receiving the GAMS log, e.g. ``sys.stdout``.
+      ``log_fn`` writes the log to a file instead.
+
+    GAMS has no "infeasible or unbounded" model status. Solvers that cannot
+    tell the two apart after presolve report the model as infeasible; with
+    CPLEX, pass ``solver_options={"rerun": "yes"}`` to rerun without presolve.
+    Duals are only returned for continuous problems.
+
+    Attributes
+    ----------
+    **solver_options
+        options for the given solver
+    """
+
+    display_name: ClassVar[str] = "GAMSPy"
+    features: ClassVar[frozenset[SolverFeature]] = frozenset(
+        {
+            SolverFeature.INTEGER_VARIABLES,
+            SolverFeature.QUADRATIC_OBJECTIVE,
+            SolverFeature.DIRECT_API,
+            SolverFeature.SOLUTION_FILE_NOT_NEEDED,
+            SolverFeature.SEMI_CONTINUOUS_VARIABLES,
+            SolverFeature.MIP_DUAL_BOUND_REPORT,
+        }
+    )
+
+    @classmethod
+    @functools.cache
+    def is_available(cls) -> bool:
+        return _has_module("gamspy")
+
+    @classmethod
+    def _license_probe(cls) -> None:
+        from linopy.gamspy_model import GamsMatrixModel
+        from linopy.matrices import Matrices
+
+        M = Matrices(
+            vlabels=np.array([0]),
+            clabels=np.array([0]),
+            A=csr_array(np.ones((1, 1))),
+            b=np.array([1.0]),
+            sense=np.array([">"]),
+            c=np.array([1.0]),
+            Q=None,
+            lb=np.array([0.0]),
+            ub=np.array([10.0]),
+            vtypes=np.array(["C"]),
+            var_scaling=np.ones(1),
+            con_scaling=np.ones(1),
+            objective_scaling=1.0,
+            objective_sense="min",
+            indicator_A=None,
+            indicator_b=np.array([]),
+            indicator_sense=np.array([]),
+            indicator_binvar=np.array([], dtype=int),
+            indicator_binval=np.array([], dtype=int),
+        )
+        gm = GamsMatrixModel(M)
+        gm.solve()
+        if not gm.has_solution:
+            raise RuntimeError(f"GAMSPy probe solve failed: {gm.model.status}")
+
+    def _build_file(self, **build_kwargs: Any) -> None:
+        """Redirect a file-based build onto the direct API; GAMS reads no LP files."""
+        if self.io_api is not None and self.io_api not in FILE_IO_APIS:
+            raise ValueError(
+                f"Keyword argument `io_api` has to be one of {IO_APIS} or None"
+            )
+        log = logger.info if self.io_api is None else logger.warning
+        log(
+            "GAMSPy does not support file IO. Building the model through the "
+            "direct API instead; pass io_api='direct' to skip this message."
+        )
+        # Model.solve unlinks only the file it gets back through `_problem_fn`.
+        problem_fn = build_kwargs.pop("problem_fn", None)
+        if problem_fn is not None:
+            self._problem_fn = Path(problem_fn)
+        build_kwargs.pop("slice_size", None)
+        build_kwargs.pop("progress", None)
+        self._build_direct(**build_kwargs)
+
+    def _new_solver_model(
+        self,
+        M: Matrices,
+        *,
+        names: Printers | None,
+        sos: list[SosSet],
+        **kwargs: Any,
+    ) -> Any:
+        from linopy.gamspy_model import GamsMatrixModel
+
+        return GamsMatrixModel(M, sos=sos)
+
+    def _split_options(self) -> dict[str, Any]:
+        """Sort the solver options into keyword arguments of ``gamspy.Model.solve``."""
+        opts = dict(self.solver_options)
+        solve_kwargs: dict[str, Any] = {}
+        if (name := opts.pop("solver", None)) is not None:
+            solve_kwargs["solver"] = name
+        if (output := opts.pop("output", None)) is not None:
+            solve_kwargs["output"] = output
+        solver_options = dict(opts.pop("solver_options", None) or {})
+        fields = gamspy.Options.model_fields
+        gams_options = {k: opts.pop(k) for k in list(opts) if k in fields}
+        solver_options.update(opts)
+        if gams_options:
+            solve_kwargs["options"] = gamspy.Options(**gams_options)
+        if solver_options:
+            solve_kwargs["solver_options"] = solver_options
+        return solve_kwargs
+
+    def _run_direct(
+        self,
+        solution_fn: Path | None = None,
+        log_fn: Path | None = None,
+        warmstart_fn: Path | None = None,
+        basis_fn: Path | None = None,
+        env: Any = None,
+        **kw: Any,
+    ) -> Result:
+        for arg, value in (
+            ("solution_fn", solution_fn),
+            ("warmstart_fn", warmstart_fn),
+            ("basis_fn", basis_fn),
+        ):
+            if value is not None:
+                logger.warning(f"GAMSPy does not support {arg}. Ignoring.")
+        return self._solve(self.solver_model, log_fn=log_fn)
+
+    def _solve(self, gm: Any, log_fn: Path | None = None) -> Result:
+        solve_kwargs = self._split_options()
+
+        if gm.trivially_infeasible():
+            status = Status.from_termination_condition(TerminationCondition.infeasible)
+            status.legacy_status = "constraint without coefficients is violated"
+            return self._make_result(status, Solution(), solver_model=gm)
+
+        with contextlib.ExitStack() as stack:
+            if log_fn is not None and "output" not in solve_kwargs:
+                solve_kwargs["output"] = stack.enter_context(
+                    open(log_fn, "w", encoding="utf-8")
+                )
+            gm.solve(**solve_kwargs)
+
+        mdl = gm.model
+        condition = _gamspy_termination_condition(mdl.status, mdl.solve_status)
+        status = Status.from_termination_condition(condition)
+        status.legacy_status = f"{mdl.status}, {mdl.solve_status}"
+
+        def get_solver_solution() -> Solution:
+            if not gm.has_solution:
+                return Solution()
+            sol = _solution_from_labels(gm.primal(), self._vlabels, self._n_vars)
+            if gm.problem.startswith("MI"):
+                # marginals of a MIP come from an optional fixed LP solve
+                dual = np.array([], dtype=float)
+            else:
+                dual = _solution_from_labels(gm.dual(), self._clabels, self._n_cons)
+            return Solution(sol, dual, float(mdl.objective_value))
+
+        solution = self.safe_get_solution(status=status, func=get_solver_solution)
+
+        runtime: float | None = None
+        mip_gap: float | None = None
+        dual_bound: float | None = None
+        with contextlib.suppress(Exception):
+            runtime = float(mdl.solve_model_time)
+        if gm.problem.startswith("MI") and gm.has_solution:
+            with contextlib.suppress(Exception):
+                dual_bound = float(mdl.objective_estimation)
+                objective = float(mdl.objective_value)
+                mip_gap = abs(objective - dual_bound) / max(abs(objective), 1e-10)
+
+        return self._make_result(
+            status,
+            solution,
+            solver_model=gm,
+            report=SolverReport(
+                runtime=runtime, mip_gap=mip_gap, dual_bound=dual_bound
+            ),
+        )
+
+
 if hasattr(os, "register_at_fork"):  # POSIX only; cuOpt is Linux-only
     # a child inherits the cached queue but not its worker; clearing the cache
     # starts a fresh worker so a child solve fails fast on CUDA's fork error
@@ -5388,6 +5642,7 @@ _SOLVER_PROBE_ORDER: tuple[str, ...] = (
     "copt",
     "cupdlpx",
     "cuopt",
+    "gamspy",
     "pips",
 )
 
