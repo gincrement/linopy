@@ -112,8 +112,7 @@ class GamsMatrixModel:
             raise ValueError("Model has no variables, cannot export to GAMSPy.")
         self.objective_sense = M.objective_sense
 
-        size = max(self.n_cols, self.n_rows)
-        size = max([size, *(len(positions) for _, positions, _ in sos)])
+        size = max([self.n_cols, self.n_rows, len(sos), *(len(p) for _, p, _ in sos)])
         # Element labels are the decimal positions, shared by every set so
         # that GAMS orders them numerically wherever they appear.
         self._uels = pd.Index(np.arange(size).astype(str))
@@ -274,7 +273,72 @@ class GamsMatrixModel:
         return eq
 
     def _add_sos(self, sos: Sequence[SosSet], M: Matrices) -> None:
-        raise NotImplementedError("SOS constraints are not supported by GAMSPy yet.")
+        """
+        Add SOS1/SOS2 sets through auxiliary SOS variables linked to the columns.
+
+        GAMS declares SOS membership by variable type, with the last index
+        running over the members of one set. Each linopy set becomes a row
+        ``k`` of an auxiliary ``x_sos{type}(k, m)`` variable, whose member index
+        ``m`` is the rank by weight, since SOS2 adjacency follows the element
+        order. An equality ties every member to its column; the auxiliary
+        variables are free, so the column keeps its own bounds.
+        """
+        import gamspy as gp
+
+        ct = self.container
+        k = gp.Set(ct, "sos_k", records=self._elements(np.arange(len(sos))))
+        m = gp.Set(
+            ct,
+            "sos_m",
+            records=self._elements(np.arange(max(len(p) for _, p, _ in sos))),
+        )
+        for sos_type in sorted({t for t, _, _ in sos}):
+            members = [
+                (index, positions[np.argsort(weights, kind="stable")])
+                for index, (t, positions, weights) in enumerate(sos)
+                if t == sos_type
+            ]
+            set_index = np.concatenate([np.full(p.size, index) for index, p in members])
+            rank = np.concatenate([np.arange(p.size) for _, p in members])
+            column = np.concatenate([p for _, p in members])
+
+            var = gp.Variable(
+                ct, f"x_sos{sos_type}", type=f"sos{sos_type}", domain=[k, m]
+            )
+            var.setRecords(
+                pd.DataFrame(
+                    {
+                        "sos_k": self._elements(set_index),
+                        "sos_m": self._elements(rank),
+                        "lower": -np.inf,
+                        "upper": np.inf,
+                    }
+                )
+            )
+            group_of_member = self._group_of[column]
+            for name, group in self.groups.items():
+                mask = group_of_member == name
+                if not mask.any():
+                    continue
+                link = gp.Set(
+                    ct,
+                    f"sos{sos_type}_map_{name}",
+                    domain=[k, m, self.i],
+                    records=pd.DataFrame(
+                        {
+                            "sos_k": self._elements(set_index[mask]),
+                            "sos_m": self._elements(rank[mask]),
+                            "i": self._elements(column[mask]),
+                        }
+                    ),
+                )
+                eq = gp.Equation(
+                    ct, f"sos{sos_type}_link_{name}", domain=[k, m, self.i]
+                )
+                eq[k, m, self.i].where[link[k, m, self.i]] = (
+                    var[k, m] == group.var[self.i]
+                )
+                self.sos_equations.append(eq)
 
     def _objective(self, M: Matrices) -> Any:
         import gamspy as gp

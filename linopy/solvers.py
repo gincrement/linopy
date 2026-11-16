@@ -5430,6 +5430,7 @@ class GAMSPy(Solver[None]):
     display_name: ClassVar[str] = "GAMSPy"
     features: ClassVar[frozenset[SolverFeature]] = frozenset(
         {
+            SolverFeature.SOS_CONSTRAINTS,
             SolverFeature.INTEGER_VARIABLES,
             SolverFeature.QUADRATIC_OBJECTIVE,
             SolverFeature.DIRECT_API,

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from linopy import Model
+from linopy import Model, Variable
 from linopy.constants import TerminationCondition
 from linopy.solvers import GAMSPy, Solver, _gamspy_termination_condition
 
@@ -251,3 +252,88 @@ def test_status_mapping(
         gamspy.ModelStatus(model_status), gamspy.SolveStatus(solve_status)
     )
     assert condition == expected
+
+
+def _sos_model(sos_type: Literal[1, 2], coeffs: list[float]) -> tuple[Model, Variable]:
+    m = Model()
+    locations = pd.Index([0, 1, 2], name="locations")
+    build = m.add_variables(coords=[locations], name="build", binary=True)
+    m.add_sos_constraints(build, sos_type=sos_type, sos_dim="locations")
+    m.add_objective(build * np.array(coeffs), sense="max")
+    return m, build
+
+
+@pytest.mark.parametrize(
+    ("sos_type", "coeffs", "expected", "objective"),
+    [
+        (1, [1, 2, 3], [0, 0, 1], 3),
+        (2, [1, 2, 3], [0, 1, 1], 5),
+        (2, [2, 1, 3], [0, 1, 1], 4),
+    ],
+)
+def test_sos_binary_maximize(
+    sos_type: Literal[1, 2],
+    coeffs: list[float],
+    expected: list[float],
+    objective: float,
+) -> None:
+    m, build = _sos_model(sos_type, coeffs)
+    assert m.solve("gamspy", io_api="direct") == ("ok", "optimal")
+    np.testing.assert_allclose(build.solution.values, expected, atol=1e-6)
+    assert m.objective.value == pytest.approx(objective)
+
+
+def test_sos2_adjacency_follows_declared_order() -> None:
+    # linopy orders SOS members as declared unless the coords ascend, so with
+    # coords 0, 2, 1 the neighbours are positions (0, 1) and (1, 2): the best
+    # pair is coords 0.0 and 2.0, worth 3 + 1.5. Adjacency by coordinate value
+    # would instead only allow pairs worth 3 + 0.5.
+    m = Model()
+    seg = pd.Index([0.0, 2.0, 1.0], name="seg")
+    lam = m.add_variables(0, 1, coords=[seg], name="lam")
+    with pytest.warns(UserWarning, match="neither ascend nor descend"):
+        m.add_sos_constraints(lam, sos_type=2, sos_dim="seg")
+    m.add_constraints(lam.sum() <= 1.5, name="budget")
+    m.add_objective(lam * np.array([3.0, 3.0, 1.0]), sense="max")
+    assert m.solve("gamspy", io_api="direct") == ("ok", "optimal")
+    assert m.objective.value == pytest.approx(4.5)
+    assert float(lam.solution.sel(seg=1.0)) == pytest.approx(0, abs=1e-9)
+
+
+def test_sos2_adjacency_follows_ascending_coords() -> None:
+    # Ascending coords are the weights; position and weight order agree, so
+    # the non-neighbours 0.0 and 2.0 cannot both be non-zero.
+    m = Model()
+    seg = pd.Index([0.0, 1.0, 2.0], name="seg")
+    lam = m.add_variables(0, 1, coords=[seg], name="lam")
+    m.add_sos_constraints(lam, sos_type=2, sos_dim="seg")
+    m.add_constraints(lam.sum() <= 1.5, name="budget")
+    m.add_objective(lam * np.array([3.0, 1.0, 3.0]), sense="max")
+    assert m.solve("gamspy", io_api="direct") == ("ok", "optimal")
+    assert m.objective.value == pytest.approx(3.5)
+    ends = lam.solution.sel(seg=0.0) * lam.solution.sel(seg=2.0)
+    assert float(ends) == pytest.approx(0, abs=1e-9)
+
+
+def test_sos1_continuous_with_quadratic_objective() -> None:
+    m = Model()
+    seg = pd.Index([0, 1, 2], name="seg")
+    x = m.add_variables(lower=0, upper=10, coords=[seg], name="x")
+    m.add_sos_constraints(x, sos_type=1, sos_dim="seg")
+    m.add_constraints(x.sum() >= 5)
+    m.add_objective((x * x).sum() + (x * np.array([0.0, -10.0, 0.0])).sum())
+    assert m.solve("gamspy", io_api="direct") == ("ok", "optimal")
+    np.testing.assert_allclose(x.solution.values, [0, 5, 0], atol=1e-5)
+    assert m.objective.value == pytest.approx(-25)
+
+
+def test_grouped_sos_sets_on_integer_variables() -> None:
+    m = Model()
+    groups = pd.Index(["a", "b"], name="group")
+    seg = pd.Index([0, 1, 2], name="seg")
+    n = m.add_variables(0, 4, coords=[groups, seg], name="n", integer=True)
+    m.add_sos_constraints(n, sos_type=1, sos_dim="seg")
+    m.add_objective(n.sum(), sense="max")
+    assert m.solve("gamspy", io_api="direct") == ("ok", "optimal")
+    assert m.objective.value == pytest.approx(8)
+    assert ((n.solution > 0).sum("seg") == 1).all()
