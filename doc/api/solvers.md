@@ -183,6 +183,11 @@ Backend restrictions on file contents and names still apply. Without a linopy `M
       members:
         - solve_scenarios
 
+::: linopy.solvers.GAMS
+    options:
+      heading_level: 4
+      members: false
+
 ::: linopy.solvers.cuOpt
     options:
       heading_level: 4

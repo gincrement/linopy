@@ -77,6 +77,14 @@ Select the GAMS solver with the `solver` option, e.g.
 models to 2,000 rows and columns; see the GAMSPy documentation for licenses
 and for installing further solvers (`gamspy install solver <name>`).
 
+Without the `gamspy` package, `m.solve("gams", solver="cplex")` runs a GAMS
+system on the command line: linopy writes an LP or MPS file, translates it with
+GAMS' `mps2gms` tool and solves it with `gams`. It uses the `gams` executable on
+your `PATH`, else the GAMS system of an installed `gamspy_base` package; the
+`sysdir` option points to another one. Further options are passed to `gams` as
+command line parameters, e.g. `reslim=60`, and `solver_options` go to the option
+file of the chosen `solver`.
+
 ### GPU-accelerated solvers
 
 For large-scale optimization problems, GPU-accelerated solvers can provide significant performance improvements:

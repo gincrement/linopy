@@ -568,6 +568,7 @@ def test_solver_time_limit_options(
         "cupdlpx": {"TimeLimit": 1},
         "cuopt": {"time_limit": 1},
         "gamspy": {"time_limit": 1},
+        "gams": {"reslim": 1},
     }
     status, condition = model.solve(
         solver,

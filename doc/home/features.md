@@ -33,6 +33,7 @@ flexible data-handling features:
     - [COPT](https://www.shanshu.ai/copt)
     - [Knitro](https://www.artelys.com/solvers/knitro/)
     - [GAMSPy](https://gamspy.readthedocs.io/) (any solver of a GAMS system)
+    - [GAMS](https://www.gams.com/) (any solver of a GAMS system, via the command line)
     - [cuOpt](https://docs.nvidia.com/cuopt/) (GPU-accelerated)
     - [cuPDLPx](https://github.com/MIT-Lu-Lab/cuPDLPx) (GPU-accelerated)
 

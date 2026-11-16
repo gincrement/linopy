@@ -381,6 +381,7 @@ class SolverName(enum.Enum):
     cuPDLPx = "cupdlpx"
     cuOpt = "cuopt"
     GAMSPy = "gamspy"
+    GAMS = "gams"
 
 
 def path_to_string(path: Path) -> str:
@@ -6209,7 +6210,17 @@ def _gamspy_termination_condition(
     model_status: Any, solve_status: Any
 ) -> TerminationCondition:
     """Map GAMSPy's ModelStatus and SolveStatus onto a termination condition."""
-    # https://gamspy.readthedocs.io/en/latest/user/notebooks/model_status.html
+    return _gams_termination_condition(
+        None if model_status is None else int(model_status.value),
+        None if solve_status is None else int(solve_status.value),
+    )
+
+
+def _gams_termination_condition(
+    model_status: int | None, solve_status: int | None
+) -> TerminationCondition:
+    """Map the GAMS model and solve status codes onto a termination condition."""
+    # https://www.gams.com/latest/docs/UG_GAMSOutput.html#UG_GAMSOutput_ModelStatus
     SOLVE_STATUS_MAP: dict[int, TerminationCondition] = {
         2: TerminationCondition.iteration_limit,
         3: TerminationCondition.time_limit,
@@ -6247,11 +6258,11 @@ def _gamspy_termination_condition(
         18: TerminationCondition.unbounded,
         19: TerminationCondition.infeasible,
     }
-    if solve_status is not None and solve_status.value in SOLVE_STATUS_MAP:
-        return SOLVE_STATUS_MAP[solve_status.value]
+    if solve_status is not None and solve_status in SOLVE_STATUS_MAP:
+        return SOLVE_STATUS_MAP[solve_status]
     if model_status is None:
         return TerminationCondition.unknown
-    return MODEL_STATUS_MAP.get(model_status.value, TerminationCondition.unknown)
+    return MODEL_STATUS_MAP.get(model_status, TerminationCondition.unknown)
 
 
 class GAMSPy(Solver[None]):
@@ -6635,6 +6646,409 @@ class GAMSPy(Solver[None]):
         )
 
 
+# --------------------------------------------------------------------------
+# GAMS command line backend
+#
+# The LP/MPS file linopy writes is translated by ``mps2gms`` (part of every
+# GAMS system) into a generic GAMS program with its data in a GDX file. A
+# small wrapper includes that program and writes the solution with ``put``
+# statements to a CSV file, so neither GAMSPy nor a GDX reader is needed.
+# --------------------------------------------------------------------------
+
+# Column variables of the program written by mps2gms; the SOS variables are
+# indexed by set and column.
+_MPS2GMS_COLUMN_VARS = (
+    ("xc", "jc"),
+    ("xb", "jb"),
+    ("xi", "ji"),
+    ("xsc", "jsc"),
+    ("xsi", "jsi"),
+)
+_MPS2GMS_SOS_VARS = (("xs1", "js1"), ("xs2", "js2"))
+# Row equations of that program with the subset of rows they are defined over.
+_MPS2GMS_ROW_EQUATIONS = (("eg", "ig"), ("el", "il"), ("ee", "ie"), ("er", "ir"))
+_GAMS_SPECIAL_VALUES = {
+    "EPS": 0.0,
+    "+INF": np.inf,
+    "INF": np.inf,
+    "-INF": -np.inf,
+    "NA": np.nan,
+    "UNDF": np.nan,
+}
+_GAMS_ABORT_PATTERNS = (
+    ("Equation infeasible due to rhs value", TerminationCondition.infeasible),
+)
+
+
+def _gams_executable(name: str, sysdir: Path | str | None = None) -> str | None:
+    """Path of the GAMS tool ``name`` in ``sysdir`` or the default GAMS system."""
+    directory = _gams_sysdir() if sysdir is None else Path(sysdir)
+    if directory is None:
+        return None
+    return shutil.which(name, path=str(directory))
+
+
+@functools.cache
+def _gams_sysdir() -> Path | None:
+    """
+    Directory of the GAMS system: the ``gams`` on PATH, else the one bundled
+    with the ``gamspy_base`` package, which is located without importing it.
+    """
+    exe = shutil.which("gams")
+    if exe is not None:
+        return Path(exe).resolve().parent
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("gamspy_base")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or spec.origin is None:
+        return None
+    directory = Path(spec.origin).parent
+    return directory if shutil.which("gams", path=str(directory)) else None
+
+
+def _gams_float(text: str) -> float:
+    """Parse a number written by a GAMS ``put`` statement."""
+    text = text.strip().strip('"')
+    special = _GAMS_SPECIAL_VALUES.get(text.upper())
+    return special if special is not None else float(text)
+
+
+def _gams_solution_program(model_gms: str) -> str:
+    """GAMS program solving ``model_gms`` and writing the results to a CSV file."""
+    lines = [
+        f'$include "{model_gms}"',
+        'file linopy_sol / "solution.csv" /;',
+        "linopy_sol.pc = 5; linopy_sol.pw = 32767;",
+        "linopy_sol.nr = 2; linopy_sol.nd = 15; linopy_sol.nw = 0;",
+        "put linopy_sol;",
+        'put "modelstat", m.modelstat / "solvestat", m.solvestat /;',
+        'put "objective", obj.l / "objest", m.objest /;',
+        'put "resusd", m.resusd / "iterusd", m.iterusd /;',
+    ]
+    for var, columns in _MPS2GMS_COLUMN_VARS:
+        lines.append(f'loop({columns}(j), put "v", j.tl, {var}.l(j) /);')
+    for var, members in _MPS2GMS_SOS_VARS:
+        lines.append(f'loop({members}(s, j), put "v", j.tl, {var}.l(s, j) /);')
+    for equation, rows in _MPS2GMS_ROW_EQUATIONS:
+        lines.append(f'loop({rows}(i), put "e", i.tl, {equation}.m(i) /);')
+    lines.append("putclose linopy_sol;")
+    return "\n".join(lines) + "\n"
+
+
+class GAMS(Solver[None]):
+    """
+    Solver subclass for GAMS, run on the command line on an LP or MPS file.
+
+    Needs a GAMS system: the ``gams`` executable on PATH or, if there is none,
+    the one bundled with the ``gamspy_base`` package. The ``gamspy`` package
+    itself is not used; see :class:`GAMSPy` for the direct API backend.
+
+    linopy writes the LP or MPS file, ``mps2gms`` translates it into a GAMS
+    program and ``gams`` solves it with any solver of the GAMS system. The
+    solution is read back from a CSV file written by the GAMS program.
+
+    Options are split by name:
+
+    * ``solver`` : the GAMS solver to use, e.g. ``"cplex"`` or ``"highs"``.
+      Defaults to the GAMS default solver for the problem type.
+    * ``solver_options`` : a dict written to the option file of ``solver``,
+      which then must be given.
+    * ``sysdir`` : the GAMS system directory, overriding the default one.
+    * Any other option is passed to ``gams`` as a command line parameter,
+      e.g. ``reslim=60``, ``threads=4`` or ``optcr=0``.
+
+    With ``solution_fn``, the GDX file holding all symbols of the solved
+    GAMS program is copied there.
+
+    Duals are only returned for continuous problems. GAMS SOS variables are
+    continuous, so solve SOS constraints on binary or integer variables with
+    ``reformulate_sos=True``. ``mps2gms`` resets the bounds of the variables in
+    the ``binary`` section of an LP file; linopy restores them for the files it
+    writes, but not for one passed to :meth:`Solver.from_file`.
+
+    Attributes
+    ----------
+    **solver_options
+        options for the given solver
+    """
+
+    display_name: ClassVar[str] = "GAMS"
+    features: ClassVar[frozenset[SolverFeature]] = frozenset(
+        {
+            SolverFeature.INTEGER_VARIABLES,
+            SolverFeature.QUADRATIC_OBJECTIVE,
+            SolverFeature.READ_MODEL_FROM_FILE,
+            SolverFeature.SOLUTION_FILE_NOT_NEEDED,
+            SolverFeature.SOS_CONSTRAINTS,
+            SolverFeature.SEMI_CONTINUOUS_VARIABLES,
+            SolverFeature.MIP_DUAL_BOUND_REPORT,
+        }
+    )
+
+    @classmethod
+    @functools.cache
+    def is_available(cls) -> bool:
+        return _gams_sysdir() is not None
+
+    @classmethod
+    def _license_probe(cls) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="linopy-gams-") as tmp:
+            problem_fn = Path(tmp) / "probe.lp"
+            problem_fn.write_text(
+                "min\nobj: x0\nst\nc0: x0 >= 1\nbounds\nx0 <= 10\nend\n"
+            )
+            result = Solver.from_file("gams", problem_fn).solve()
+        if not result.status.is_ok:
+            raise RuntimeError(f"GAMS probe solve failed: {result.status}")
+
+    def _gams_arguments(self, workdir: Path) -> tuple[dict[str, str], Path | None]:
+        """Command line parameters of ``gams`` and the system directory."""
+        opts = dict(self.solver_options)
+        sysdir = opts.pop("sysdir", None)
+        solver = opts.pop("solver", None)
+        solver_options = opts.pop("solver_options", None) or {}
+        params: dict[str, str] = {}
+        if solver is not None:
+            params["solver"] = str(solver)
+        if solver_options:
+            if solver is None:
+                raise ValueError(
+                    "GAMS needs the `solver` option to write `solver_options` "
+                    "to the option file of that solver."
+                )
+            lines = [f"{k} {v}" for k, v in solver_options.items()]
+            (workdir / f"{str(solver).lower()}.opt").write_text("\n".join(lines) + "\n")
+            params["optfile"] = "1"
+        params.update({k: str(v) for k, v in opts.items()})
+        return params, None if sysdir is None else Path(sysdir)
+
+    def _run_file(
+        self,
+        solution_fn: Path | None = None,
+        log_fn: Path | None = None,
+        warmstart_fn: Path | None = None,
+        basis_fn: Path | None = None,
+        env: None = None,
+        **kw: Any,
+    ) -> Result:
+        import tempfile
+
+        problem_fn = self._problem_fn
+        assert problem_fn is not None
+        io_api = read_io_api_from_problem_file(problem_fn)
+        sense = read_sense_from_problem_file(problem_fn)
+        for arg, value in (("warmstart_fn", warmstart_fn), ("basis_fn", basis_fn)):
+            if value is not None:
+                logger.warning(f"GAMS does not support {arg}. Ignoring.")
+
+        with tempfile.TemporaryDirectory(prefix="linopy-gams-") as tmp:
+            workdir = Path(tmp)
+            params, sysdir = self._gams_arguments(workdir)
+            mps2gms = _gams_executable("mps2gms", sysdir)
+            gams = _gams_executable("gams", sysdir)
+            if mps2gms is None or gams is None:
+                raise FileNotFoundError(
+                    "No GAMS system with `gams` and `mps2gms` found"
+                    + ("" if sysdir is None else f" in {sysdir}")
+                    + "."
+                )
+
+            key = "LP" if io_api in ("lp", "lp-polars") else "MPS"
+            translate = sub.run(
+                [
+                    mps2gms,
+                    f"{key}={Path(problem_fn).resolve()}",
+                    "GDX=model.gdx",
+                    "GMS=model.gms",
+                    "PY=",
+                    "DUPLICATES=ADD",
+                ],
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+            )
+            if translate.returncode != 0:
+                raise RuntimeError(
+                    f"mps2gms failed to translate {problem_fn}:\n"
+                    f"{translate.stdout}{translate.stderr}"
+                )
+            model_gms = workdir / "model.gms"
+            problem_type = self._problem_type(model_gms)
+            if key == "LP":
+                self._restore_binary_bounds(model_gms)
+            (workdir / "run.gms").write_text(_gams_solution_program("model.gms"))
+
+            params = {"lo": "3", **params}
+            if log_fn is not None:
+                params.update(lo="2", lf=str(Path(log_fn).resolve()))
+            if solution_fn is not None:
+                params.setdefault("gdx", "solution.gdx")
+            command = [gams, "run.gms", *(f"{k}={v}" for k, v in params.items())]
+            returncode, output = self._run_gams(command, workdir)
+
+            solution_csv = workdir / "solution.csv"
+            if not solution_csv.exists():
+                if log_fn is not None and Path(log_fn).exists():
+                    output = Path(log_fn).read_text(errors="replace").splitlines()
+                return self._aborted_result(
+                    returncode, workdir / "run.lst", output[-20:]
+                )
+
+            if solution_fn is not None:
+                Path(solution_fn).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(workdir / params["gdx"], solution_fn)
+            info, primal, dual = self._read_solution(solution_csv)
+
+        model_status = int(info["modelstat"])
+        solve_status = int(info["solvestat"])
+        condition = _gams_termination_condition(model_status, solve_status)
+        status = Status.from_termination_condition(condition)
+        status.legacy_status = f"ModelStatus {model_status}, SolveStatus {solve_status}"
+        has_solution = model_status in _GAMS_STATUSES_WITH_SOLUTION
+        is_mip = problem_type.startswith("mi")
+
+        def get_solver_solution() -> Solution:
+            if not has_solution:
+                return Solution()
+            sol = _solution_from_names(
+                np.fromiter(primal.values(), float, len(primal)),
+                list(primal),
+                self._n_vars,
+            )
+            if is_mip:
+                duals = np.array([], dtype=float)
+            else:
+                duals = _solution_from_names(
+                    np.fromiter(dual.values(), float, len(dual)),
+                    list(dual),
+                    self._n_cons,
+                )
+            return Solution(sol, duals, info["objective"])
+
+        solution = self.safe_get_solution(status=status, func=get_solver_solution)
+        solution = maybe_adjust_objective_sign(solution, io_api, sense)
+
+        mip_gap: float | None = None
+        dual_bound: float | None = None
+        if is_mip and has_solution and np.isfinite(info["objest"]):
+            dual_bound = info["objest"]
+            mip_gap = abs(info["objective"] - dual_bound) / max(
+                abs(info["objective"]), 1e-10
+            )
+        iterations = info["iterusd"]
+        report = SolverReport(
+            runtime=info["resusd"],
+            mip_gap=mip_gap,
+            dual_bound=dual_bound,
+            simplex_iterations=int(iterations) if np.isfinite(iterations) else None,
+        )
+        self.io_api = io_api
+        return self._make_result(status, solution, report=report)
+
+    @staticmethod
+    def _problem_type(model_gms: Path) -> str:
+        """The model type of the solve statement mps2gms wrote, e.g. ``"rmip"``."""
+        match = re.search(
+            r"^Solve\s+m\s+using\s+(\w+)", model_gms.read_text(), re.MULTILINE
+        )
+        return match.group(1).lower() if match else ""
+
+    def _restore_binary_bounds(self, model_gms: Path) -> None:
+        """
+        Set the bounds of binary variables other than 0 and 1 before the solve.
+
+        mps2gms resets the bounds of the variables in the ``binary`` section of
+        an LP file, so fixed binaries would be free again. Only possible when
+        linopy wrote the file from its model.
+        """
+        model = self.model
+        if model is None:
+            return
+        statements = []
+        for name in model.variables.binaries:
+            var = model.variables[name]
+            labels = var.labels.values.ravel()
+            lower = np.broadcast_to(var.lower.values, var.labels.shape).ravel()
+            upper = np.broadcast_to(var.upper.values, var.labels.shape).ravel()
+            mask = (labels != -1) & ((lower != 0) | (upper != 1))
+            for label, lo, up in zip(
+                labels[mask].tolist(), lower[mask].tolist(), upper[mask].tolist()
+            ):
+                statements.append(
+                    f'xb.lo("x{label}") = {lo!r}; xb.up("x{label}") = {up!r};'
+                )
+        if not statements:
+            return
+        text = model_gms.read_text()
+        solve = re.search(r"^Solve\s", text, re.MULTILINE)
+        assert solve is not None
+        model_gms.write_text(
+            text[: solve.start()] + "\n".join(statements) + "\n" + text[solve.start() :]
+        )
+
+    @staticmethod
+    def _run_gams(command: list[str], workdir: Path) -> tuple[int, list[str]]:
+        """Run ``gams``, sending its console output to the linopy logger."""
+        output: list[str] = []
+        with sub.Popen(
+            command,
+            cwd=workdir,
+            stdout=sub.PIPE,
+            stderr=sub.STDOUT,
+            text=True,
+        ) as p:
+            assert p.stdout is not None
+            for line in p.stdout:
+                line = line.rstrip("\n")
+                output.append(line)
+                logger.info(line)
+        return p.returncode, output
+
+    def _aborted_result(
+        self, returncode: int, listing: Path, output: list[str]
+    ) -> Result:
+        """The result of a GAMS run that stopped before writing a solution."""
+        text = listing.read_text(errors="replace") if listing.exists() else ""
+        for pattern, condition in _GAMS_ABORT_PATTERNS:
+            if pattern in text:
+                status = Status.from_termination_condition(condition)
+                status.legacy_status = pattern
+                return self._make_result(status, Solution())
+        errors = [line for line in text.splitlines() if line.startswith("****")]
+        details = "\n".join(errors or output)
+        raise RuntimeError(
+            f"GAMS stopped with return code {returncode} before writing a "
+            f"solution.\n{details}"
+        )
+
+    @staticmethod
+    def _read_solution(
+        path: Path,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+        """Model attributes, column levels and row marginals from the CSV file."""
+        import csv
+
+        info: dict[str, float] = {}
+        primal: dict[str, float] = {}
+        dual: dict[str, float] = {}
+        with open(path, newline="") as f:
+            for row in csv.reader(f, skipinitialspace=True):
+                if not row:
+                    continue
+                if row[0] == "v":
+                    primal[row[1]] = _gams_float(row[2])
+                elif row[0] == "e":
+                    dual[row[1]] = _gams_float(row[2])
+                else:
+                    info[row[0]] = _gams_float(row[1])
+        return info, primal, dual
+
+
 if hasattr(os, "register_at_fork"):  # POSIX only; cuOpt is Linux-only
     # a child inherits the cached queue but not its worker; clearing the cache
     # starts a fresh worker so a child solve fails fast on CUDA's fork error
@@ -6682,6 +7096,7 @@ _SOLVER_PROBE_ORDER: tuple[str, ...] = (
     "cupdlpx",
     "cuopt",
     "gamspy",
+    "gams",
     "pips",
 )
 

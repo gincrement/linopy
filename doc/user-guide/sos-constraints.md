@@ -226,7 +226,7 @@ s5: S2 ::  x3:0  x4:1  x5:2
 
 ## Solver Compatibility
 
-Only Gurobi, CPLEX, Xpress and GAMSPy support SOS constraints natively. Check a solver
+Only Gurobi, CPLEX, Xpress, GAMSPy and GAMS support SOS constraints natively. Check a solver
 with `linopy.solvers.Gurobi.supports(linopy.solvers.SolverFeature.SOS_CONSTRAINTS)`.
 
 **Supported solvers:**
@@ -235,6 +235,8 @@ with `linopy.solvers.Gurobi.supports(linopy.solvers.SolverFeature.SOS_CONSTRAINT
 - Xpress (direct API via `xpress`, or LP file)
 - CPLEX (LP file)
 - GAMSPy (direct API via `gamspy`, with any GAMS solver that supports SOS constraints)
+- GAMS (LP file, with any GAMS solver that supports SOS constraints; SOS variables
+  must be continuous, so pass `reformulate_sos=True` for SOS constraints on binaries)
 
 **Unsupported solvers:**
 

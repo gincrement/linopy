@@ -151,6 +151,7 @@ Fri    0          4
 * [MOSEK](https://www.mosek.com/)
 * [COPT](https://www.shanshu.ai/copt)
 * [GAMSPy](https://gamspy.readthedocs.io/) (any solver of a GAMS system)
+* [GAMS](https://www.gams.com/) (any solver of a GAMS system, via the command line)
 * [cuOpt](https://docs.nvidia.com/cuopt/)
 * [cuPDLPx](https://github.com/MIT-Lu-Lab/cuPDLPx)
 * [Knitro](https://www.artelys.com/solvers/knitro/)
